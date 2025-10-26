@@ -1,0 +1,63 @@
+exp_name: UGCA_DTI
+seed: 2025
+device: cuda
+precision: amp
+
+data:
+  dataset: [DAVIS, BindingDB, BioSNAP]
+  folds: [1, 2, 3, 4, 5]
+  train_csv_tmpl: "data/${dataset}/fold${fold}_train.csv"
+  test_csv_tmpl:  "data/${dataset}/fold${fold}_test.csv"
+  num_workers: 8
+  batch_size: 32
+
+cache:
+  esm2_dir: "cache/esm2"
+  molclr_dir: "cache/molclr"
+  chemberta_dir: "cache/chemberta"
+  dtype: "fp16"
+
+model:
+  d: 256
+  ugca:
+    layers: 1
+    heads: 4
+    dropout: 0.15
+    evidential: true
+    g_min: 0.05
+    rho: 0.6
+    budget_lambda: 1.0e-2
+    topk_enable: true
+    topk_ratio: 0.5
+    k_warmup_epochs: 10
+  pooling:
+    type: "attn"         # mean|max|attn
+  mutan:
+    enable: true
+    rank_R: 20
+    z_dim: 256
+    dropout: 0.2
+  classifier:
+    hidden: [256]
+    dropout: 0.2
+    bias: true
+
+train:
+  total_epochs: 50
+  stageA_epochs: 15                 # Stage-A 关闭门控
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  loss:
+    main: bce                       # bce|bce_weighted|focal
+    edl_lambda: 1.0e-3
+  save_last_k: 5
+  log_interval: 100
+
+eval:
+  threshold: 0.5                    # 或 "max_f1" | "youden"
+  metrics: [auroc, auprc, f1, acc, sensitivity, mcc]
+  reliability: false                # 若为 true，额外导出 ECE/可靠度曲线
