@@ -11,10 +11,29 @@
    - 将 `fold{1..5}_train.csv` 与 `fold{1..5}_test.csv` 放入 `data/{DAVIS|BindingDB|BioSNAP}/`。
    - CSV 必含列：`smiles,protein,label`（0/1）。
 3. 可选：一次性离线抽取（建议首次运行）
+   - ems-2
    ```bash
-   python src/offline/esm2_extract.py       --csv_glob "data/DAVIS/fold*_*.csv"       --out cache/esm2
-   python src/offline/molclr_extract.py     --csv_glob "data/DAVIS/fold*_*.csv"       --out cache/molclr
-   python src/offline/chemberta_extract.py  --csv_glob "data/DAVIS/fold*_*.csv"       --out cache/chemberta
+   python src/offline/esm2_extract.py \
+   --csv_glob "data/DAVIS/fold*_*.csv" \
+   --out /root/lanyun-tmp/cache/esm2 \
+   --dataset DAVIS \
+   --model_dir /root/lanyun-tmp/hf/esm2_t33_650M_UR50D \
+   --offline \
+   --device cuda \
+   --dtype fp16 \
+   --chunk_len 1000
+   ```
+   - chemberta
+   ```bash
+   python src/offline/chemberta_extract.py \
+   --csv_glob "data/DAVIS/fold*_*.csv" \
+   --out /root/lanyun-tmp/cache/chemberta \
+   --dataset DAVIS \
+   --model_dir /root/lanyun-tmp/hf/ChemBERTa-77M-MLM \
+   --offline \
+   --device cuda \
+   --dtype fp16 \
+   --pool cls
    ```
 4. 训练与评测（示例：DAVIS）
    ```bash
