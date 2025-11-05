@@ -1,88 +1,250 @@
 from __future__ import annotations
-import hashlib
-from pathlib import Path
+# -*- coding: utf-8 -*-
+
+import csv
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple, List
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-def _hash(s: str) -> str:
-    import hashlib
-    return hashlib.sha1(s.encode()).hexdigest()[:24]
-
+# ---------------- Config ----------------
 @dataclass
 class DMConfig:
     train_csv: str
     test_csv: str
-    batch_size: int = 32
     num_workers: int = 8
-    cache_dirs: Dict[str, str] = None  # {esm2, molclr, chemberta}
+    batch_size: int = 64
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+    drop_last: bool = False
 
-def _load_cache(cache_root: str, key: str):
-    p = Path(cache_root) / f"{key}.npz"
-    if p.exists():
-        return dict(np.load(p, allow_pickle=False))
-    return None
+@dataclass
+class CacheDirs:
+    esm2_dir: str
+    molclr_dir: str
+    chemberta_dir: str
 
+@dataclass
+class CacheDims:
+    esm2: int = 1280
+    molclr: int = 300
+    chemberta: int = 384
+
+# ---------------- Utils ----------------
+def _read_table(path: str) -> List[Dict[str, str]]:
+    p = Path(path)
+    sep = _sniff_sep(p)
+    with p.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=sep)
+        return [r for r in reader]
+
+def _sniff_sep(path: Path) -> str:
+    with path.open("rb") as f:
+        head = f.read(4096)
+    text = head.decode("utf-8", errors="ignore")
+    return "\t" if text.count("\t") > text.count(",") else ","
+
+def _npz_load_first_key(npz_path: Path) -> np.ndarray:
+    d = np.load(npz_path, allow_pickle=True, mmap_mode=None)
+    k = list(d.keys())[0]
+    return d[k]
+
+def _zeros(d: int, dtype=np.float32) -> np.ndarray:
+    return np.zeros((d,), dtype=dtype)
+
+def _to_binary(v: Any) -> int:
+    s = str(v).strip().lower()
+    if s in {"1","1.0","true","t","yes","y","active"}:  return 1
+    if s in {"0","0.0","false","f","no","n","inactive"}: return 0
+    try:    return int(float(s) >= 0.5)
+    except: return 0
+
+def _as_1d_float32(arr: Any, target_dim: int) -> np.ndarray:
+    """
+    把任意形状/类型的输入（含 object 数组、list、2D）规整为 (target_dim,) 的 np.float32 向量。
+    - object/列表：尝试 stack -> 2D
+    - 2D：对第0维做均值 -> 1D
+    - 写成 C 连续、可写
+    - 维度不符自动 pad 或截断
+    """
+    if not isinstance(arr, np.ndarray):
+        arr = np.asarray(arr, dtype=object)
+
+    if arr.dtype == object:
+        try:
+            arr = np.stack([np.asarray(x) for x in arr], axis=0)
+        except Exception:
+            arr = np.asarray(arr, dtype=np.float32)
+
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.ndim >= 2:
+        arr = arr.reshape(arr.shape[0], -1).mean(0)
+
+    v = np.asarray(arr, dtype=np.float32)
+    if not v.flags.c_contiguous:
+        v = np.ascontiguousarray(v)
+
+    if v.shape[0] != target_dim:
+        if v.shape[0] < target_dim:
+            pad = np.zeros((target_dim - v.shape[0],), dtype=np.float32)
+            v = np.concatenate([v, pad], axis=0)
+        else:
+            v = v[:target_dim]
+
+    if not v.flags.writeable:
+        v = v.copy()
+    return v
+
+def _stack_to_tensor(items: List[Any]) -> torch.Tensor:
+    x0 = items[0]
+    if isinstance(x0, torch.Tensor):
+        return torch.stack(items, dim=0)
+    if isinstance(x0, np.ndarray):
+        arr = np.stack(items, axis=0)
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        if arr.dtype not in (np.float32, np.float16, np.float64):
+            arr = arr.astype(np.float32, copy=False)
+        return torch.tensor(arr, dtype=torch.float32)  # 安全转换
+    return torch.tensor(items, dtype=torch.float32)
+
+def _to_tensor_safe(v: Any) -> torch.Tensor:
+    """
+    比 from_numpy 更鲁棒的转换：总是先 np.asarray(float32)，
+    再 torch.tensor(copy=True)；可兼容 object/只读/跨模块 ndarray。
+    """
+    arr = np.asarray(v, dtype=np.float32)
+    if not arr.flags.c_contiguous:
+        arr = np.ascontiguousarray(arr)
+    return torch.tensor(arr, dtype=torch.float32)
+
+# ---------------- Dataset ----------------
 class DTIDataset(Dataset):
-    def __init__(self, csv_path: str, cache_dirs: Dict[str,str]):
-        self.df = pd.read_csv(csv_path)
-        assert set(['smiles','protein','label']).issubset(self.df.columns)
-        self.cache_dirs = cache_dirs
+    def __init__(self, csv_path: str, cache_dirs: CacheDirs, dims: CacheDims):
+        self.path = csv_path
+        self.rows = _read_table(csv_path)
+        self.dims = dims
 
-    def __len__(self): return len(self.df)
+        self.esm2_dir = Path(cache_dirs.esm2_dir)
+        self.molclr_dir = Path(cache_dirs.molclr_dir)
+        self.chemberta_dir = Path(cache_dirs.chemberta_dir)
 
-    def __getitem__(self, i) -> Dict[str, Any]:
-        r = self.df.iloc[i]
-        smi = str(r['smiles']); seq = str(r['protein']); y = float(r['label'])
-        k_smi = _hash(smi); k_seq = _hash(seq)
-        drug = _load_cache(self.cache_dirs['molclr'], k_smi) or {}
-        prot = _load_cache(self.cache_dirs['esm2'],   k_seq) or {}
-        chem = _load_cache(self.cache_dirs['chemberta'], k_smi) or {}
-        H_D = drug.get('drug_atoms', np.zeros((1, 64), dtype=np.float32))
-        H_P = prot.get('protein',    np.zeros((max(1,len(seq)), 64), dtype=np.float32))
-        h_C = chem.get('chemberta',  np.zeros((384,), dtype=np.float32))
-        return {
-            'smiles': smi, 'protein': seq, 'label': y,
-            'H_D': H_D, 'H_P': H_P, 'h_C': h_C,
-        }
+        self._protein_cache: Dict[str, torch.Tensor] = {}
+        self._drug_cache: Dict[str, torch.Tensor] = {}
+        self._chem_cache: Dict[str, torch.Tensor] = {}
 
-def _pad2d(arrs: List[np.ndarray]):
-    maxn = max(a.shape[0] for a in arrs)
-    dim  = arrs[0].shape[1]
-    out = torch.zeros((len(arrs), maxn, dim), dtype=torch.float32)
-    mask = torch.zeros((len(arrs), maxn), dtype=torch.bool)
-    for i,a in enumerate(arrs):
-        n = a.shape[0]
-        out[i,:n,:] = torch.from_numpy(a.astype(np.float32))
-        mask[i,:n] = True
-    return out, mask
+        self._esm2_tbl = self._build_lookup(self.esm2_dir)
+        self._molclr_tbl = self._build_lookup(self.molclr_dir)
+        self._chem_tbl = self._build_lookup(self.chemberta_dir)
 
-def collate(batch: List[Dict[str,Any]]) -> Dict[str,Any]:
-    HD = [b['H_D'] for b in batch]
-    HP = [b['H_P'] for b in batch]
-    import numpy as np
-    hC = np.stack([b['h_C'] for b in batch]).astype(np.float32)
-    y  = torch.tensor([b['label'] for b in batch], dtype=torch.float32)
-    HD_t, mD = _pad2d(HD)
-    HP_t, mP = _pad2d(HP)
-    hC_t = torch.from_numpy(hC)
-    return {
-        'H_D': HD_t, 'mask_D': mD,
-        'H_P': HP_t, 'mask_P': mP,
-        'h_C': hC_t,
-        'labels': y,
-        'info': {'smiles': [b['smiles'] for b in batch], 'protein': [b['protein'] for b in batch]},
-    }
+        import time
+        t0 = time.time()
+        for i in range(min(2, len(self.rows))):
+            _ = self._fetch_one(i)
+        print(f"[PRELOAD] ESM2~{len(self._protein_cache)}, MolCLR~{len(self._drug_cache)}, ChemBERTa~{len(self._chem_cache)}  |  took {time.time()-t0:.1f}s")
 
+    @staticmethod
+    def _build_lookup(dir_path: Path) -> Dict[str, Path]:
+        tbl = {}
+        if dir_path.exists():
+            for p in dir_path.glob("*.npz"):
+                tbl[p.stem] = p
+        return tbl
+
+    def __len__(self): return len(self.rows)
+
+    def _find_any_npz(self, tbl: Dict[str, Path]) -> Optional[Path]:
+        if not tbl: return None
+        return next(iter(tbl.values()))
+
+    def _fetch_one(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        row = self.rows[idx]
+        y = _to_binary(row.get("label", row.get("Label", row.get("y", "0"))))
+
+        # --- ESM2 ---
+        t_v1 = self._protein_cache.get(str(idx))
+        if t_v1 is None:
+            p = self._find_any_npz(self._esm2_tbl)
+            if p and p.exists():
+                arr = _npz_load_first_key(p)
+                v = _as_1d_float32(arr, self.dims.esm2)
+            else:
+                v = _zeros(self.dims.esm2)
+            t_v1 = _to_tensor_safe(v) if not isinstance(v, torch.Tensor) else v
+            self._protein_cache[str(idx)] = t_v1
+
+        # --- MolCLR ---
+        t_v2 = self._drug_cache.get(str(idx))
+        if t_v2 is None:
+            p = self._find_any_npz(self._molclr_tbl)
+            if p and p.exists():
+                arr = _npz_load_first_key(p)
+                v = _as_1d_float32(arr, self.dims.molclr)
+            else:
+                v = _zeros(self.dims.molclr)
+            t_v2 = _to_tensor_safe(v) if not isinstance(v, torch.Tensor) else v
+            self._drug_cache[str(idx)] = t_v2
+
+        # --- ChemBERTa ---
+        t_v3 = self._chem_cache.get(str(idx))
+        if t_v3 is None:
+            p = self._find_any_npz(self._chem_tbl)
+            if p and p.exists():
+                arr = _npz_load_first_key(p)
+                v = _as_1d_float32(arr, self.dims.chemberta)
+            else:
+                v = _zeros(self.dims.chemberta)
+            t_v3 = _to_tensor_safe(v) if not isinstance(v, torch.Tensor) else v
+            self._chem_cache[str(idx)] = t_v3
+
+        return t_v1, t_v2, t_v3, float(y)
+
+    def __getitem__(self, idx: int):
+        return self._fetch_one(idx)
+
+# ---------------- collate ----------------
+def dti_collate(batch: List[Tuple[Any, Any, Any, Any]]):
+    v1s, v2s, v3s, ys = list(zip(*batch))
+    V1 = _stack_to_tensor(list(v1s))
+    V2 = _stack_to_tensor(list(v2s))
+    V3 = _stack_to_tensor(list(v3s))
+    Y  = torch.as_tensor(ys, dtype=torch.float32)
+    return V1, V2, V3, Y
+
+# ---------------- DataModule ----------------
 class DataModule:
-    def __init__(self, cfg: DMConfig):
+    def __init__(self, cfg: DMConfig, cache_dirs: CacheDirs, dims: CacheDims):
         self.cfg = cfg
-        self.train_set = DTIDataset(cfg.train_csv, cfg.cache_dirs)
-        self.test_set  = DTIDataset(cfg.test_csv,  cfg.cache_dirs)
-    def loaders(self):
-        tr = DataLoader(self.train_set, batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers, collate_fn=collate)
-        te = DataLoader(self.test_set,  batch_size=self.cfg.batch_size, shuffle=False, num_workers=self.cfg.num_workers, collate_fn=collate)
-        return tr, te
+        self.dims = dims
+        self.train_set = DTIDataset(cfg.train_csv, cache_dirs, dims)
+        self.test_set  = DTIDataset(cfg.test_csv,  cache_dirs, dims)
+
+    def train_loader(self) -> DataLoader:
+        return DataLoader(
+            self.train_set,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory,
+            persistent_workers=self.cfg.persistent_workers and self.cfg.num_workers > 0,
+            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
+            drop_last=self.cfg.drop_last,
+            collate_fn=dti_collate,
+        )
+
+    def test_loader(self) -> DataLoader:
+        return DataLoader(
+            self.test_set,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory,
+            persistent_workers=self.cfg.persistent_workers and self.cfg.num_workers > 0,
+            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
+            collate_fn=dti_collate,
+        )
