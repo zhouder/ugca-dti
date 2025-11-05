@@ -1,63 +1,55 @@
+# 训练全局
 exp_name: UGCA_DTI
 seed: 2025
-device: cuda
-precision: amp
+device: cuda           # cpu | cuda
+precision: amp         # amp | fp32
 
+# 数据相关
 data:
-  dataset: [DAVIS, BindingDB, BioSNAP]
+  dataset: [DAVIS, BindingDB, BioSNAP]     # 可传命令行 --dataset 覆盖
   folds: [1, 2, 3, 4, 5]
-  train_csv_tmpl: "data/${dataset}/fold${fold}_train.csv"
-  test_csv_tmpl:  "data/${dataset}/fold${fold}_test.csv"
-  num_workers: 8
-  batch_size: 32
+  # 注意：模板里 ${dataset} 用大写，方便你现有的目录
+  train_csv_tmpl: "/root/lanyun-tmp/${dataset}_k5_clean_seed42/fold${fold}_train.csv"
+  test_csv_tmpl:  "/root/lanyun-tmp/${dataset}_k5_clean_seed42/fold${fold}_test.csv"
 
+  # DataLoader
+  batch_size: 128          # 1D特征（mean pooling 后）很小，可以用大batch提速
+  num_workers: 4           # 可尝试 4/6/8；若被系统 Killed 就降回 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+  # 预加载缓存（会把 cache/*.npz 读进内存，并在读取时做 mean pooling）
+  preload_cache: true      # 首个 epoch 前会打印耗时
+
+# 预编码缓存目录
 cache:
-  esm2_dir: "cache/esm2"
-  molclr_dir: "cache/molclr"
-  chemberta_dir: "cache/chemberta"
-  dtype: "fp16"
+  esm2_dir:      "/root/lanyun-tmp/cache/esm2"
+  molclr_dir:    "/root/lanyun-tmp/cache/molclr"
+  chemberta_dir: "/root/lanyun-tmp/cache/chemberta"
 
+# 维度（用于占位模型）
+cache_dims:
+  esm2: 1280
+  molclr: 300
+  chemberta: 384
+
+# 占位模型（简化版 MLP，用 pooled 一维特征拼接），你的正式 UGCA 模型可在 src/model.py 中 build_model 覆盖
 model:
-  d: 256
-  ugca:
-    layers: 1
-    heads: 4
-    dropout: 0.15
-    evidential: true
-    g_min: 0.05
-    rho: 0.6
-    budget_lambda: 1.0e-2
-    topk_enable: true
-    topk_ratio: 0.5
-    k_warmup_epochs: 10
-  pooling:
-    type: "attn"         # mean|max|attn
-  mutan:
-    enable: true
-    rank_R: 20
-    z_dim: 256
-    dropout: 0.2
-  classifier:
-    hidden: [256]
-    dropout: 0.2
-    bias: true
+  mlp_hidden: [1024, 512]
+  dropout: 0.2
 
+# 训练
 train:
   total_epochs: 50
-  stageA_epochs: 15                 # Stage-A 关闭门控
   optimizer: adamw
   lr: 3.0e-4
   weight_decay: 1.0e-4
-  scheduler: cosine
-  warmup_ratio: 0.05
   grad_clip: 1.0
-  loss:
-    main: bce                       # bce|bce_weighted|focal
-    edl_lambda: 1.0e-3
-  save_last_k: 5
-  log_interval: 100
+  save_last_k: 3        # 简化保存：只保留最近 K 个
+  log_interval: 50
 
+# 评估
 eval:
-  threshold: 0.5                    # 或 "max_f1" | "youden"
-  metrics: [auroc, auprc, f1, acc, sensitivity, mcc]
-  reliability: false                # 若为 true，额外导出 ECE/可靠度曲线
+  metrics: [auroc, auprc, f1, acc]
+  threshold: 0.5        # 简化：固定阈值（如果要 max_f1，可再加一段 sweep）

@@ -5,6 +5,8 @@
 ## 快速开始
 1. 安装依赖
    ```bash
+   conda create -n ugca-dti python=3.10 
+   conda activate ugca-dti
    pip install -r requirements.txt
    ```
 2. 准备数据
@@ -23,7 +25,7 @@
    --dtype fp16 \
    --chunk_len 1000
    ```
-   - chemberta
+   - chemberta（目前是384维，后面可以用768维）
    ```bash
    python src/offline/chemberta_extract.py \
    --csv_glob "data/DAVIS/fold*_*.csv" \
@@ -35,6 +37,18 @@
    --dtype fp16 \
    --pool cls
    ```
+   - molclr
+   ```bash
+   export MOLCLR_HOME=/root/ugca-dti
+   export CKPT=/root/lanyun-tmp/hf/MolCLR/ckpt/pretrained_gin/checkpoints/model.pth
+   export OUT=/root/lanyun-tmp/cache/molclr
+
+   python "$MOLCLR_HOME/src/offline/molclr_extract.py" \
+   --csv_glob "/root/lanyun-tmp/davis_k5_seed42/fold*_*.csv" \
+   --out "$OUT" --dataset DAVIS \
+   --mode molclr --molclr_repo "$MOLCLR_HOME" --ckpt "$CKPT" \
+   --device cuda --dtype fp16 --hidden 300 --layers 5
+   ``` 
 4. 训练与评测（示例：DAVIS）
    ```bash
    python src/train.py --config configs/ugca_dti.yaml --dataset DAVIS
