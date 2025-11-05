@@ -48,6 +48,7 @@ train:
   grad_clip: 1.0
   save_last_k: 3        # 简化保存：只保留最近 K 个
   log_interval: 50
+  select: AUROC
 
 # 评估
 eval:
