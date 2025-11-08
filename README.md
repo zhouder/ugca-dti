@@ -51,11 +51,11 @@
    ``` 
 4. 训练与评测（示例：DAVIS）
    ```bash
-   python src/train.py --config configs/ugca_dti.yaml --dataset DAVIS
+   python -m src/train.py \
+   --dataset DAVIS \
+   --dataset-dirname davis_k5 \
+   --data-root /root/lanyun-tmp \
+   --out /root/lanyun-tmp/ugca-runs/davis \
+   --epochs 60 --batch-size 256 --workers 6 --lr 2e-4
    ```
-5. 汇总报告（均值±标准差）
-   ```bash
-   python src/eval.py --root runs/DAVIS --out runs/DAVIS_summary.json
-   ```
-
-**注意**：离线脚本在缺少预训练权重时会自动采用安全回退（零向量或简化特征），不影响端到端跑通。接入真实权重后，即可无缝替换缓存内容复现论文结果。
+    当中断训练，利用添加--resume继续训练（采用`last.pt`）
