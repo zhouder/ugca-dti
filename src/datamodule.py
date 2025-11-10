@@ -4,20 +4,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+import hashlib, time, csv, random
 
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-# ===================== 配置结构体 =====================
-
+# ---------------- configs ----------------
 @dataclass
 class DMConfig:
     train_csv: str
     test_csv: str
-    batch_size: int = 256
-    num_workers: int = 6
+    batch_size: int = 64
+    num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True
     prefetch_factor: int = 2
@@ -25,257 +24,253 @@ class DMConfig:
 
 @dataclass
 class CacheDirs:
-    # 传 esm 目录，内部会自动尝试 esm / esm2 的回退
-    esm2_dir: str        # e.g. /root/lanyun-tmp/cache/esm/DAVIS
-    molclr_dir: str      # e.g. /root/lanyun-tmp/cache/molclr/DAVIS
-    chemberta_dir: str   # e.g. /root/lanyun-tmp/cache/chemberta/DAVIS
+    esm2_dir: str
+    molclr_dir: str
+    chemberta_dir: str
 
 @dataclass
 class CacheDims:
-    esm2: int = 1280
-    molclr: int = 300
-    chemberta: int = 384
+    esm2: int
+    molclr: int
+    chemberta: int
 
+# ---------------- utils ----------------
+def _sha1_24(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:24]
 
-# ===================== 工具函数 =====================
-
-def _scan_npz_dir(dir_path: Path) -> Dict[str, Path]:
-    """扫描目录，返回 {样本ID: 文件路径}。样本ID取文件名（不含后缀）"""
-    table: Dict[str, Path] = {}
+def _index_npz_dir(dir_path: Path) -> Dict[str, Path]:
+    tbl: Dict[str, Path] = {}
     if not dir_path.exists():
-        return table
-    for p in dir_path.glob("*.npz"):
-        key = p.stem
-        table[key] = p
-    return table
+        return tbl
+    for p in dir_path.rglob("*.npz"):
+        tbl[p.stem] = p
+    return tbl
 
-def _try_esm_fallback(p: Path) -> Path:
-    """esm/esm2 目录兜底：给 esm 路径时，若不存在则尝试 esm2；反之同理。"""
-    if p.exists():
-        return p
-    name = p.name.lower()
-    if name == "esm":
-        cand = p.with_name("esm2")
-        return cand if cand.exists() else p
-    if name == "esm2":
-        cand = p.with_name("esm")
-        return cand if cand.exists() else p
-    return p
+def _npz_load_first_key(p: Optional[Path]) -> Optional[np.ndarray]:
+    if p is None or not p.exists():
+        return None
+    with np.load(str(p)) as z:
+        k = list(z.files)[0]
+        return z[k]
 
-def _infer_columns(df: pd.DataFrame) -> Tuple[str, str, str]:
-    """
-    根据常见列名推断 (drug_id_col, protein_id_col, label_col)
-    支持的一些别名：drug / drug_id / ligand / mol / smiles_id
-                   protein / protein_id / target / seq_id
-                   label / y
-    """
-    candidates = [
-        (["drug", "drug_id", "ligand", "mol", "smiles_id"], ["protein", "protein_id", "target", "seq_id"], ["label", "y"]),
-    ]
-    cols = set(c.lower() for c in df.columns)
-    for drug_cands, prot_cands, lab_cands in candidates:
-        drug_col = next((c for c in drug_cands if c in cols), None)
-        prot_col = next((c for c in prot_cands if c in cols), None)
-        lab_col  = next((c for c in lab_cands  if c in cols), None)
-        if drug_col and prot_col and lab_col:
-            return drug_col, prot_col, lab_col
-    # 回退：尽量匹配前三列
-    names = list(df.columns)
-    if len(names) < 3:
-        raise ValueError("CSV 至少需要三列（drug/protein/label 或其他可识别别名）。")
-    return names[0], names[1], names[2]
-
-def _load_npz_vec(path: Path) -> np.ndarray:
-    """从 .npz 里读取向量，容错支持常见 key：'x' / 'feat' / 'arr_0'。"""
-    with np.load(str(path)) as npz:
-        for k in ("x", "feat", "arr_0"):
-            if k in npz:
-                arr = npz[k]
-                break
+def _as_1d(x: Optional[np.ndarray], target_dim: int) -> np.ndarray:
+    if x is None:
+        out = np.zeros((target_dim,), dtype=np.float32)
+    else:
+        try:
+            x = np.asarray(x)
+            if x.ndim == 2:
+                x = x.mean(axis=0)
+            x = np.asarray(x, dtype=np.float32)
+        except Exception:
+            return np.zeros((target_dim,), dtype=np.float32)
+        x = x.reshape(-1)
+        if x.shape[0] < target_dim:
+            pad = np.zeros((target_dim - x.shape[0],), dtype=np.float32)
+            out = np.concatenate([x, pad], axis=0)
         else:
-            # 取第一个数组
-            k0 = list(npz.keys())[0]
-            arr = npz[k0]
-    arr = np.asarray(arr, dtype=np.float32).squeeze()
-    if arr.ndim > 1:
-        arr = arr.reshape(-1).astype(np.float32)
-    return arr
+            out = x[:target_dim]
+    if not out.flags["C_CONTIGUOUS"]:
+        out = np.ascontiguousarray(out, dtype=np.float32)
+    return out
 
+def _to_tensor(x: np.ndarray) -> torch.Tensor:
+    try:
+        arr = np.array(x, dtype=np.float32, copy=True, order="C")
+    except Exception:
+        arr = np.zeros((1,), dtype=np.float32)
+    return torch.tensor(arr, dtype=torch.float32)
 
-# ===================== 数据集 =====================
+def _read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[float]]:
+    smiles, proteins, labels = [], [], []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter=",", quoting=csv.QUOTE_MINIMAL)
+        header = next(reader, None)
 
-class UGCDataset(Dataset):
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        col_drug: str,
-        col_prot: str,
-        col_label: str,
-        idx_esm: Dict[str, Path],
-        idx_mol: Dict[str, Path],
-        idx_chem: Dict[str, Path],
-        dims: CacheDims,
-    ):
-        self.df = df.reset_index(drop=True)
-        self.c_d, self.c_p, self.c_y = col_drug, col_prot, col_label
-        self.idx_esm = idx_esm
-        self.idx_mol = idx_mol
-        self.idx_chem = idx_chem
+        si = pi = li = None
+        if header:
+            heads = [c.strip().lower() for c in header]
+            if all(x in heads for x in ("smiles", "protein", "label")):
+                si, pi, li = heads.index("smiles"), heads.index("protein"), heads.index("label")
+            else:
+                si, pi, li = 0, 1, 2
+                if len(header) >= 3:
+                    try:
+                        labels.append(float(header[2])); smiles.append(header[0]); proteins.append(header[1])
+                    except Exception:
+                        pass
+        else:
+            si, pi, li = 0, 1, 2
+
+        for row in reader:
+            if not row or len(row) <= max(si, pi, li):
+                continue
+            s, p, l = row[si], row[pi], row[li]
+            try:
+                labels.append(float(l)); smiles.append(s); proteins.append(p)
+            except Exception:
+                continue
+    return smiles, proteins, labels
+
+_AMINO = set("ACDEFGHIKLMNPQRSTVWY")
+def _prot_variants(s: str) -> List[str]:
+    raw = s or ""
+    v = [raw, raw.strip(), "".join(raw.split()), "".join(raw.split()).upper()]
+    only_aa = "".join(ch for ch in raw if ch.upper() in _AMINO)
+    if only_aa:
+        v += [only_aa, only_aa.upper()]
+    out, seen = [], set()
+    for x in v:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+def _smiles_variants(s: str) -> List[str]:
+    raw = s or ""
+    v = [raw, raw.strip(), raw.replace(" ", ""), "".join(raw.split())]
+    out, seen = [], set()
+    for x in v:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+def _lookup(tbl: Dict[str, Path], keys: List[str]) -> Optional[Path]:
+    for k in keys:
+        key = _sha1_24(k)
+        p = tbl.get(key)
+        if p is not None:
+            return p
+    return None
+
+# ---------------- dataset ----------------
+class DTIDataset(Dataset):
+    def __init__(self, csv_path: str,
+                 esm2_tbl: Dict[str, Path],
+                 molclr_tbl: Dict[str, Path],
+                 chem_tbl: Dict[str, Path],
+                 dims: CacheDims):
+        self.smiles, self.proteins, self.labels = _read_smiles_protein_label(csv_path)
+        self.esm2_tbl = esm2_tbl
+        self.molclr_tbl = molclr_tbl
+        self.chem_tbl = chem_tbl
         self.dims = dims
+        # 进程内缓存
+        self._cache_p, self._cache_d1, self._cache_d2 = {}, {}, {}
 
-        # 预计算命中统计
-        hits_e, hits_m, hits_c = 0, 0, 0
-        for _, row in self.df.iterrows():
-            did = str(row[self.c_d])
-            pid = str(row[self.c_p])
-            if pid in self.idx_esm:  hits_e += 1
-            if did in self.idx_mol:  hits_m += 1
-            if did in self.idx_chem: hits_c += 1
-        n = len(self.df)
-        print(f"[PRELOAD] Index ESM2={len(self.idx_esm)} MoLCLR={len(self.idx_mol)} ChemBERTa={len(self.idx_chem)}")
-        print(f"[HIT/train] sample={n} | ESM2={hits_e/n:>5.1%} MoLCLR={hits_m/n:>5.1%} ChemBERTa={hits_c/n:>5.1%} | ALL-3={(hits_e==n and hits_m==n and hits_c==n)}")
+    def __len__(self):
+        return len(self.labels)
 
-    def __len__(self): return len(self.df)
+    def _vec_cached(self, p: Optional[Path], d: int, cache: dict) -> torch.Tensor:
+        if p is None:
+            return torch.zeros((d,), dtype=torch.float32)
+        k = str(p)
+        v = cache.get(k)
+        if v is None:
+            arr = _as_1d(_npz_load_first_key(Path(k)), d)
+            v = _to_tensor(arr)  # CPU tensor
+            cache[k] = v
+        return v
 
-    def __getitem__(self, i: int):
-        r = self.df.iloc[i]
-        did = str(r[self.c_d])
-        pid = str(r[self.c_p])
-        y   = float(r[self.c_y])
+    def __getitem__(self, idx: int):
+        smi = self.smiles[idx]
+        pro = self.proteins[idx]
+        y   = float(self.labels[idx])
 
-        # 读取向量（缺失则用零向量兜底）
-        if pid in self.idx_esm:
-            pe = _load_npz_vec(self.idx_esm[pid])
-        else:
-            pe = np.zeros((self.dims.esm2,), dtype=np.float32)
+        p_path  = _lookup(self.esm2_tbl, _prot_variants(pro))
+        d1_path = _lookup(self.molclr_tbl, _smiles_variants(smi))
+        d2_path = _lookup(self.chem_tbl,  _smiles_variants(smi))
 
-        if did in self.idx_mol:
-            dm = _load_npz_vec(self.idx_mol[did])
-        else:
-            dm = np.zeros((self.dims.molclr,), dtype=np.float32)
+        v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)
+        v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)
+        v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)
+        return v_p, v_d1, v_d2, torch.tensor(y, dtype=torch.float32)
 
-        if did in self.idx_chem:
-            dc = _load_npz_vec(self.idx_chem[did])
-        else:
-            dc = np.zeros((self.dims.chemberta,), dtype=np.float32)
-
-        # numpy -> torch
-        pe = torch.from_numpy(pe).float()
-        dm = torch.from_numpy(dm).float()
-        dc = torch.from_numpy(dc).float()
-        y  = torch.tensor(y, dtype=torch.float32)
-
-        # 保证形状一致（1D 向量）
-        pe = pe.view(-1)
-        dm = dm.view(-1)
-        dc = dc.view(-1)
-
-        return pe, dm, dc, y
-
-
-# ===================== DataModule =====================
-
+# ---------------- datamodule ----------------
 class DataModule:
     def __init__(self, cfg: DMConfig, cache_dirs: CacheDirs, dims: CacheDims):
         self.cfg = cfg
         self.cache_dirs = cache_dirs
         self.dims = dims
 
-        # —— 解析 CSV
-        self.train_df = pd.read_csv(self.cfg.train_csv)
-        self.test_df  = pd.read_csv(self.cfg.test_csv)
+        # ------- 兼容 esm / esm2 两种命名 -------
+        esm_candidates = [Path(cache_dirs.esm2_dir)]
+        # 如果传入的是 .../esm/XXX，就自动再尝试把 esm -> esm2
+        if "esm" + "/" in cache_dirs.esm2_dir and "/esm2/" not in cache_dirs.esm2_dir:
+            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm/", "/esm2/")))
+        # 如果传入的是 .../esm2/XXX，就再尝试 esm
+        if "/esm2/" in cache_dirs.esm2_dir:
+            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm2/", "/esm/")))
 
-        # 推断列名
-        self.col_d, self.col_p, self.col_y = _infer_columns(self.train_df)
-        # test 缺列名时，跟随 train 同名列
-        for need_col in (self.col_d, self.col_p, self.col_y):
-            if need_col not in set(c.lower() for c in self.test_df.columns):
-                # 如果 test 列不一致，尝试通过位置映射
-                # 简单容错：按位置拷贝一致的列名
-                pass
+        picked_esm = None
+        esm_tbl = {}
+        for cand in esm_candidates:
+            tbl = _index_npz_dir(cand)
+            if len(tbl) > 0:
+                picked_esm, esm_tbl = cand, tbl
+                break
+        if picked_esm is None:
+            picked_esm = esm_candidates[0]
+            esm_tbl = _index_npz_dir(picked_esm)
 
-        # —— 索引编码缓存
-        self.idx_esm_train, self.idx_mol_train, self.idx_chem_train = self._build_indices(for_dataset="train")
-        self.idx_esm_test,  self.idx_mol_test,  self.idx_chem_test  = self._build_indices(for_dataset="test")
+        self.esm_dir_used = str(picked_esm)
+        self.esm2_tbl = esm_tbl
+        self.molclr_tbl = _index_npz_dir(Path(self.cache_dirs.molclr_dir))
+        self.chem_tbl  = _index_npz_dir(Path(self.cache_dirs.chemberta_dir))
+        print(f"[CACHE] esm_dir_used={self.esm_dir_used}")
+        print(f"[CACHE] molclr_dir  ={self.cache_dirs.molclr_dir}")
+        print(f"[CACHE] chem_dir    ={self.cache_dirs.chemberta_dir}")
 
-        # —— 构造 Dataset
-        self.train_set = UGCDataset(
-            self.train_df, self.col_d, self.col_p, self.col_y,
-            self.idx_esm_train, self.idx_mol_train, self.idx_chem_train,
-            self.dims
-        )
-        print(f"[INFO] train size = {len(self.train_set):>5d} | batch_size = {self.cfg.batch_size}")
+        t0 = time.time()
+        t1 = time.time()
+        print(f"[PRELOAD] Index ESM2={len(self.esm2_tbl)} MolCLR={len(self.molclr_tbl)} ChemBERTa={len(self.chem_tbl)}   took {t1 - t0:.1f}s")
 
-        self.test_set = UGCDataset(
-            self.test_df, self.col_d, self.col_p, self.col_y,
-            self.idx_esm_test, self.idx_mol_test, self.idx_chem_test,
-            self.dims
-        )
-        print(f"[INFO] test  size = {len(self.test_set):>5d}")
+        self._report_hit_rates(cfg.train_csv, tag="train")
+        self._report_hit_rates(cfg.test_csv,  tag="test")
 
-    # ---------- 公共 ----------
-    def _build_indices(self, for_dataset: str):
-        """
-        根据 CSV 所属的数据集（DAVIS / BindingDB / BioSNAP），到 cache 子目录下扫描 npz。
-        这里假设目录结构为：
-          cache/
-            esm/       <DatasetName>/*.npz
-            esm2/      <DatasetName>/*.npz     （可二选一）
-            molclr/    <DatasetName>/*.npz
-            chemberta/ <DatasetName>/*.npz
-        """
-        # 推断数据集名（DAVIS/BindingDB/BioSNAP），从 csv 路径中提取
-        csv_path = Path(self.cfg.train_csv if for_dataset == "train" else self.cfg.test_csv)
-        # 默认使用上层目录名，如 .../davis_k5/fold1_train.csv -> davis 或 DAVIS
-        dataset_name = csv_path.parent.name.split("_")[0]
-        # 大小写规范化映射
-        name_map = {"davis": "DAVIS", "bindingdb": "BindingDB", "biosnap": "BioSNAP"}
-        dataset_name = name_map.get(dataset_name.lower(), dataset_name)
+    def _report_hit_rates(self, csv_path: str, tag: str):
+        smi, pro, lab = _read_smiles_protein_label(csv_path)
+        n = len(lab)
+        if n == 0:
+            print(f"[HIT/{tag}] empty CSV: {csv_path}")
+            return
+        idxs = list(range(n))
+        if n > 2000:
+            random.seed(42); idxs = random.sample(idxs, 2000)
 
-        # 三路目录
-        esm_base = _try_esm_fallback(Path(self.cache_dirs.esm2_dir).parent / dataset_name)
-        if not esm_base.exists():
-            # 如果传入已经是 .../esm/DAVIS，则 _try_esm_fallback 已经做了回退，这里再兜底一次
-            esm_base = _try_esm_fallback(Path(self.cache_dirs.esm2_dir))
+        hit_p = hit_d1 = hit_d2 = hit_all = 0
+        for i in idxs:
+            p = _lookup(self.esm2_tbl, _prot_variants(pro[i]))
+            d1 = _lookup(self.molclr_tbl, _smiles_variants(smi[i]))
+            d2 = _lookup(self.chem_tbl,  _smiles_variants(smi[i]))
+            hp = p is not None
+            hd1 = d1 is not None
+            hd2 = d2 is not None
+            hit_p += hp; hit_d1 += hd1; hit_d2 += hd2; hit_all += (hp and hd1 and hd2)
 
-        mol_base = Path(self.cache_dirs.molclr_dir).parent / dataset_name
-        chem_base = Path(self.cache_dirs.chemberta_dir).parent / dataset_name
+        total = len(idxs)
+        def pct(x): return f"{x/total*100:.1f}%"
+        print(f"[HIT/{tag}] sample={total} | ESM2={pct(hit_p)} MolCLR={pct(hit_d1)} ChemBERTa={pct(hit_d2)} | ALL-3={pct(hit_all)}")
 
-        idx_esm  = _scan_npz_dir(esm_base)
-        idx_mol  = _scan_npz_dir(mol_base)
-        idx_chem = _scan_npz_dir(chem_base)
-
-        # 打印一次
-        tag = "train" if for_dataset == "train" else "test"
-        print(f"[{tag.upper()}] cache roots:")
-        print(f"  ESM : {esm_base}")
-        print(f"  MolC: {mol_base}")
-        print(f"  Chem: {chem_base}")
-        print(f"[{tag.upper()}] index sizes: ESM2={len(idx_esm)} MoLCLR={len(idx_mol)} ChemBERTa={len(idx_chem)}")
-
-        return idx_esm, idx_mol, idx_chem
-
-    # ---------- DataLoader ----------
     def train_loader(self) -> DataLoader:
+        ds = DTIDataset(self.cfg.train_csv, self.esm2_tbl, self.molclr_tbl, self.chem_tbl, self.dims)
         return DataLoader(
-            self.train_set,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory,
-            persistent_workers=(self.cfg.num_workers > 0 and self.cfg.persistent_workers),
-            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
-            drop_last=self.cfg.drop_last,
+            ds, batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
+            prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last,
+            collate_fn=lambda b: (torch.stack([x[0] for x in b]),
+                                  torch.stack([x[1] for x in b]),
+                                  torch.stack([x[2] for x in b]),
+                                  torch.stack([x[3] for x in b]))
         )
 
     def test_loader(self) -> DataLoader:
+        ds = DTIDataset(self.cfg.test_csv, self.esm2_tbl, self.molclr_tbl, self.chem_tbl, self.dims)
         return DataLoader(
-            self.test_set,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory,
-            persistent_workers=(self.cfg.num_workers > 0 and self.cfg.persistent_workers),
-            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
-            drop_last=False,
+            ds, batch_size=self.cfg.batch_size, shuffle=False, num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
+            prefetch_factor=self.cfg.prefetch_factor, drop_last=False,
+            collate_fn=lambda b: (torch.stack([x[0] for x in b]),
+                                  torch.stack([x[1] for x in b]),
+                                  torch.stack([x[2] for x in b]),
+                                  torch.stack([x[3] for x in b]))
         )
