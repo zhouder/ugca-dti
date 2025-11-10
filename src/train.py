@@ -37,28 +37,30 @@ def compute_metrics(prob: np.ndarray, y_true: np.ndarray, thr: float = 0.5) -> D
     except Exception: out["auprc"] = float("nan")
     return out
 
-# 单行对齐格式
 def fmt1(m: Dict[str, float]) -> str:
     return (f"AUROC {m['auroc']:>7.4f} | AUPRC {m['auprc']:>7.4f} | "
             f"F1 {m['f1']:>7.4f} | ACC {m['acc']:>7.4f} | "
             f"SEN {m['sen']:>7.4f} | MCC {m['mcc']:>7.4f}")
 
-# ===== 模型：优先 build_model(cfg)（UGCAModel+UGCAUnit+MUTAN） =====
-def build_model_from_src(dims: CacheDims, prefer_class: str | None = None) -> nn.Module:
+# ===== 模型装载（优先 build_model(cfg)） =====
+def build_model_from_src(dims: CacheDims, prefer_class: str | None = None, sequence: bool = False) -> nn.Module:
     model_mod = importlib.import_module("src.model")
     if hasattr(model_mod, "build_model"):
-        print("[Model] 使用 src.model.build_model(cfg) 构建 UGCAModel（含 UGCAUnit + MUTAN + 分类头）")
+        print("[Model] 使用 src.model.build_model(cfg)")
         cfg = {
             "d_protein": int(dims.esm2),
             "d_molclr":  int(dims.molclr),
             "d_chem":    int(dims.chemberta),
             "d_model":   512, "dropout": 0.1, "act": "silu",
             "mutan_rank": 10, "mutan_dim": 512, "head_hidden": 512,
+            # V2 相关
+            "sequence": bool(sequence),
+            "nhead": 4, "nlayers": 2
         }
         return getattr(model_mod, "build_model")(cfg)
 
     cand_names = [prefer_class] if prefer_class else []
-    cand_names += ["UGCAModel", "UGCA", "Model"]
+    cand_names += ["UGCAModel", "UGCASeqModel", "UGCA", "Model"]
     for name in cand_names:
         if not name: continue
         c = getattr(model_mod, name, None)
@@ -69,22 +71,41 @@ def build_model_from_src(dims: CacheDims, prefer_class: str | None = None) -> nn
             except TypeError:
                 try: return c(dims)
                 except Exception: return c({"d_protein": dims.esm2, "d_molclr": dims.molclr, "d_chem": dims.chemberta})
-    # 兜底
-    candidates = [
-        (name, obj) for name, obj in inspect.getmembers(model_mod, inspect.isclass)
-        if obj.__module__ == model_mod.__name__ and issubclass(obj, nn.Module)
-    ]
-    for name, cls in candidates:
-        if any(tok in name.lower() for tok in ["norm","block","head","layer","unit"]):
-            continue
-        print(f"[INFO] 未找到指定类，自动使用 {name}")
-        try:    return cls({"d_protein": dims.esm2, "d_molclr": dims.molclr, "d_chem": dims.chemberta})
-        except TypeError: return cls(dims)
     raise RuntimeError("在 src/model.py 中没找到可用的模型类。")
 
-# ===== 训练 epoch（以“样本数”为单位；完成后保留 100%；无多余空条） =====
+# ===== 训练/测试 =====
+def _batch_to_device(batch, device):
+    if len(batch) == 4:
+        v1, v2, v3, y = batch
+        return (v1.to(device, non_blocking=True),
+                v2.to(device, non_blocking=True),
+                v3.to(device, non_blocking=True),
+                y.to(device))
+    elif len(batch) == 6:
+        P, Pm, D, Dm, C, y = batch
+        return (P.to(device, non_blocking=True),
+                Pm.to(device, non_blocking=True),
+                D.to(device, non_blocking=True),
+                Dm.to(device, non_blocking=True),
+                C.to(device, non_blocking=True),
+                y.to(device))
+    else:
+        raise RuntimeError(f"Unknown batch format len={len(batch)}")
+
+def _forward_any(model: nn.Module, batch_tensors):
+    if len(batch_tensors) == 4:
+        v1, v2, v3, y = batch_tensors
+        logits = model(v1, v2, v3)
+        return logits, y
+    else:
+        P, Pm, D, Dm, C, y = batch_tensors
+        # UGCASeqModel.forward(P, Pm, D, Dm, C)
+        logits = model(P, Pm, D, Dm, C)
+        return logits, y
+
 def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
-                optimizer: optim.Optimizer, tag: str, ep: int, ep_total: int) -> Tuple[float, float]:
+                optimizer: optim.Optimizer, tag: str, ep: int, ep_total: int,
+                gate_budget: float = 0.0, gate_rho: float = 0.6) -> Tuple[float, float]:
     model.train(True)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
@@ -95,17 +116,26 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
     pbar = tqdm(total=total_samples, ncols=120, unit="ex",
                 desc=f"[{tag}] epoch {ep}/{ep_total}", leave=True, position=0)
 
-    for (v1, v2, v3, y) in loader:
-        bs = v1.size(0)
-        v1, v2, v3, y = v1.to(device, non_blocking=True), v2.to(device, non_blocking=True), v3.to(device, non_blocking=True), y.to(device)
-
-        logits = model(v1, v2, v3)
+    for batch in loader:
+        batch = _batch_to_device(batch, device)
+        logits, y = _forward_any(model, batch)
         loss = bce(logits, y)
+
+        # ===== 门控预算正则（可选，V2 有效；V1 返回 None） =====
+        if gate_budget > 0.0 and hasattr(model, "last_gates"):
+            gd, gp = model.last_gates()
+            if gd is not None and gp is not None:
+                # 对每个样本计算 token 级均值，再对 batch 求均值
+                def _mean1d(g): return g.mean(dim=1).mean()
+                Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
+                loss = loss + gate_budget * Lb
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
 
+        bs = y.size(0)
         tot += float(loss.detach().cpu())
         n_seen += bs
         pbar.update(bs)
@@ -113,9 +143,8 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
             pbar.set_postfix_str(f"{n_seen}/{total_samples} ex | loss {tot * 1.0 / (n_seen / bs):.4f}")
 
     pbar.close()
-    return tot / max(1, n_seen / bs), time.time() - t0  # 返回按 batch 的平均 loss 与耗时
+    return tot / max(1, n_seen / bs), time.time() - t0
 
-# ===== 测试 epoch（无进度条） =====
 def test_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, np.ndarray, np.ndarray, float]:
     model.train(False)
     bce = nn.BCEWithLogitsLoss()
@@ -123,10 +152,10 @@ def test_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tu
     probs, labels = [], []
     t0 = time.time()
 
-    for (v1, v2, v3, y) in loader:
-        v1, v2, v3, y = v1.to(device, non_blocking=True), v2.to(device, non_blocking=True), v3.to(device, non_blocking=True), y.to(device)
+    for batch in loader:
+        batch = _batch_to_device(batch, device)
         with torch.no_grad():
-            logits = model(v1, v2, v3)
+            logits, y = _forward_any(model, batch)
             loss = bce(logits, y)
         tot += float(loss.detach().cpu())
         probs.append(torch.sigmoid(logits).detach().cpu().numpy())
@@ -169,7 +198,8 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
             train_csv=train_csv, test_csv=test_csv,
             num_workers=args.workers, batch_size=args.batch_size,
             pin_memory=True, persistent_workers=args.workers>0,
-            prefetch_factor=2, drop_last=False
+            prefetch_factor=2, drop_last=False,
+            sequence=args.sequence
         ),
         cache_dirs=cache_dirs, dims=dims
     )
@@ -177,9 +207,9 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
     train_loader = dm.train_loader()
     test_loader  = dm.test_loader()
     N = len(train_loader.dataset)
-    print(f"[INFO] train size = {N} | batch_size = {args.batch_size}")
+    print(f"[INFO] train size = {N} | batch_size = {args.batch_size} | sequence={args.sequence}")
 
-    model = build_model_from_src(dims, args.model_class).to(device)
+    model = build_model_from_src(dims, args.model_class, sequence=args.sequence).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     fold_dir = Path(args.out) / f"fold{fold}"
@@ -198,7 +228,9 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
     best_epoch = -1
 
     for ep in range(1, args.epochs + 1):
-        tr_loss, tr_t = train_epoch(model, train_loader, device, optimizer, tag=f"{ds_lower}/train", ep=ep, ep_total=args.epochs)
+        tr_loss, tr_t = train_epoch(model, train_loader, device, optimizer,
+                                    tag=f"{ds_lower}/train", ep=ep, ep_total=args.epochs,
+                                    gate_budget=args.gate_budget, gate_rho=args.gate_rho)
         te_loss, prob, y, te_t = test_epoch(model, test_loader, device)
         m = compute_metrics(prob, y)
 
@@ -209,7 +241,6 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
                         f"{m['acc']:.6f}", f"{m['sen']:.6f}", f"{m['mcc']:.6f}",
                         f"{tr_t:.1f}", f"{te_t:.1f}"])
 
-        # 单行对齐打印
         print(f"[{ds_lower}] fold{fold} ep{ep:03d} | train_loss {tr_loss:.4f} | test_loss {te_loss:.4f} | {fmt1(m)} | time {tr_t:.1f}s/{te_t:.1f}s")
 
         save_ckpt(fold_dir / "last.pth", model, ep, m, optimizer.state_dict())
@@ -254,7 +285,7 @@ def summarize(rows: List[Dict[str,float]], out_dir: Path):
         w = csv.writer(f)
         w.writerow(["metric","mean","std"])
         for k in keys:
-            w.writerow([k.upper(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
+            w.writerow([k.UPPER(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
 
     s = " | ".join([f"{k.upper()} {mean[k]:>7.4f}±{std[k]:<7.4f}" for k in keys])
     print(f"[SUMMARY over 5 folds] {s}")
@@ -263,7 +294,7 @@ def summarize(rows: List[Dict[str,float]], out_dir: Path):
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="bindingdb / davis / biosnap（不区分大小写）")
-    ap.add_argument("--dataset-dirname", required=True, help="如 bindingdb_k5 / davis_k5 / biosnap_k5")
+    ap.add_argument("--dataset-dirname", required=True, help="如 bindingdb / davis / biosnap")
     ap.add_argument("--data-root", required=True, help="如 /root/lanyun-tmp")
     ap.add_argument("--out", required=True, help="如 /root/lanyun-tmp/ugca-runs/bindingdb")
     ap.add_argument("--epochs", type=int, default=60)
@@ -271,12 +302,15 @@ def parse_args():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--resume", default="")
-    ap.add_argument("--model-class", default="UGCAModel", help="src/model.py 的类名（若无需，可忽略；默认 UGCAModel）")
+    ap.add_argument("--model-class", default="", help="通常不用；除非你显式选类（如 UGCASeqModel）")
+    # 新增：V2 序列级与门控预算
+    ap.add_argument("--sequence", action="store_true", help="启用 per-token（序列级）模式")
+    ap.add_argument("--gate-budget", type=float, default=0.0, help="门控预算正则系数 λb（0 关闭）")
+    ap.add_argument("--gate-rho", type=float, default=0.6, help="目标平均开度 ρ（一般 0.6 左右）")
     return ap.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    # 只在启动时打印一次 CUDA/GPU 信息
     print(f"[ENV] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}")
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
