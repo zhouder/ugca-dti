@@ -36,7 +36,6 @@ class CacheDims:
 
 # ---------------- utils ----------------
 def _sha1_24(s: str) -> str:
-    # 离线脚本使用的命名规则：sha1(s) 的前 24 位
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:24]
 
 def _index_npz_dir(dir_path: Path) -> Dict[str, Path]:
@@ -82,7 +81,6 @@ def _to_tensor(x: np.ndarray) -> torch.Tensor:
         arr = np.zeros((1,), dtype=np.float32)
     return torch.tensor(arr, dtype=torch.float32)
 
-# ---- CSV（只取三列） ----
 def _read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[float]]:
     smiles, proteins, labels = [], [], []
     with open(path, "r", encoding="utf-8", newline="") as f:
@@ -114,22 +112,13 @@ def _read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[fl
                 continue
     return smiles, proteins, labels
 
-# ---- 关键：生成多种 key 变体并查表 ----
-_AMINO = set("ACDEFGHIKLMNPQRSTVWY")  # 20 标准氨基酸
-
+_AMINO = set("ACDEFGHIKLMNPQRSTVWY")
 def _prot_variants(s: str) -> List[str]:
     raw = s or ""
-    v = []
-    v.append(raw)
-    v.append(raw.strip())
-    v.append("".join(raw.split()))                  # 去所有空白
-    v.append("".join(raw.split()).upper())         # 去空白 + 大写
-    # 非法字符清理（只保留 20 种氨基酸）
+    v = [raw, raw.strip(), "".join(raw.split()), "".join(raw.split()).upper()]
     only_aa = "".join(ch for ch in raw if ch.upper() in _AMINO)
     if only_aa:
-        v.append(only_aa)
-        v.append(only_aa.upper())
-    # 去重保持顺序
+        v += [only_aa, only_aa.upper()]
     out, seen = [], set()
     for x in v:
         if x not in seen:
@@ -138,12 +127,7 @@ def _prot_variants(s: str) -> List[str]:
 
 def _smiles_variants(s: str) -> List[str]:
     raw = s or ""
-    v = []
-    v.append(raw)
-    v.append(raw.strip())
-    v.append(raw.replace(" ", ""))                 # 去空格
-    v.append("".join(raw.split()))                 # 去所有空白
-    # RDKit 规范化此处不做（避免依赖），先尽量命中已有 md5 命名
+    v = [raw, raw.strip(), raw.replace(" ", ""), "".join(raw.split())]
     out, seen = [], set()
     for x in v:
         if x not in seen:
@@ -158,7 +142,6 @@ def _lookup(tbl: Dict[str, Path], keys: List[str]) -> Optional[Path]:
             return p
     return None
 
-
 # ---------------- dataset ----------------
 class DTIDataset(Dataset):
     def __init__(self, csv_path: str,
@@ -167,30 +150,40 @@ class DTIDataset(Dataset):
                  chem_tbl: Dict[str, Path],
                  dims: CacheDims):
         self.smiles, self.proteins, self.labels = _read_smiles_protein_label(csv_path)
-
         self.esm2_tbl = esm2_tbl
         self.molclr_tbl = molclr_tbl
         self.chem_tbl = chem_tbl
         self.dims = dims
+        # 进程内缓存
+        self._cache_p, self._cache_d1, self._cache_d2 = {}, {}, {}
 
     def __len__(self):
         return len(self.labels)
+
+    def _vec_cached(self, p: Optional[Path], d: int, cache: dict) -> torch.Tensor:
+        if p is None:
+            return torch.zeros((d,), dtype=torch.float32)
+        k = str(p)
+        v = cache.get(k)
+        if v is None:
+            arr = _as_1d(_npz_load_first_key(Path(k)), d)
+            v = _to_tensor(arr)  # CPU tensor
+            cache[k] = v
+        return v
 
     def __getitem__(self, idx: int):
         smi = self.smiles[idx]
         pro = self.proteins[idx]
         y   = float(self.labels[idx])
 
-        # 多变体查找
-        p_path = _lookup(self.esm2_tbl, _prot_variants(pro))
+        p_path  = _lookup(self.esm2_tbl, _prot_variants(pro))
         d1_path = _lookup(self.molclr_tbl, _smiles_variants(smi))
-        d2_path = _lookup(self.chem_tbl, _smiles_variants(smi))
+        d2_path = _lookup(self.chem_tbl,  _smiles_variants(smi))
 
-        v_p  = _as_1d(_npz_load_first_key(p_path),  self.dims.esm2)
-        v_d1 = _as_1d(_npz_load_first_key(d1_path), self.dims.molclr)
-        v_d2 = _as_1d(_npz_load_first_key(d2_path), self.dims.chemberta)
-
-        return _to_tensor(v_p), _to_tensor(v_d1), _to_tensor(v_d2), torch.tensor(y, dtype=torch.float32)
+        v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)
+        v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)
+        v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)
+        return v_p, v_d1, v_d2, torch.tensor(y, dtype=torch.float32)
 
 # ---------------- datamodule ----------------
 class DataModule:
@@ -199,14 +192,38 @@ class DataModule:
         self.cache_dirs = cache_dirs
         self.dims = dims
 
-        t0 = time.time()
-        self.esm2_tbl = _index_npz_dir(Path(self.cache_dirs.esm2_dir))
+        # ------- 兼容 esm / esm2 两种命名 -------
+        esm_candidates = [Path(cache_dirs.esm2_dir)]
+        # 如果传入的是 .../esm/XXX，就自动再尝试把 esm -> esm2
+        if "esm" + "/" in cache_dirs.esm2_dir and "/esm2/" not in cache_dirs.esm2_dir:
+            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm/", "/esm2/")))
+        # 如果传入的是 .../esm2/XXX，就再尝试 esm
+        if "/esm2/" in cache_dirs.esm2_dir:
+            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm2/", "/esm/")))
+
+        picked_esm = None
+        esm_tbl = {}
+        for cand in esm_candidates:
+            tbl = _index_npz_dir(cand)
+            if len(tbl) > 0:
+                picked_esm, esm_tbl = cand, tbl
+                break
+        if picked_esm is None:
+            picked_esm = esm_candidates[0]
+            esm_tbl = _index_npz_dir(picked_esm)
+
+        self.esm_dir_used = str(picked_esm)
+        self.esm2_tbl = esm_tbl
         self.molclr_tbl = _index_npz_dir(Path(self.cache_dirs.molclr_dir))
         self.chem_tbl  = _index_npz_dir(Path(self.cache_dirs.chemberta_dir))
+        print(f"[CACHE] esm_dir_used={self.esm_dir_used}")
+        print(f"[CACHE] molclr_dir  ={self.cache_dirs.molclr_dir}")
+        print(f"[CACHE] chem_dir    ={self.cache_dirs.chemberta_dir}")
+
+        t0 = time.time()
         t1 = time.time()
         print(f"[PRELOAD] Index ESM2={len(self.esm2_tbl)} MolCLR={len(self.molclr_tbl)} ChemBERTa={len(self.chem_tbl)}   took {t1 - t0:.1f}s")
 
-        # 自检：抽样统计命中率（各 2000 条以内）
         self._report_hit_rates(cfg.train_csv, tag="train")
         self._report_hit_rates(cfg.test_csv,  tag="test")
 
@@ -228,10 +245,7 @@ class DataModule:
             hp = p is not None
             hd1 = d1 is not None
             hd2 = d2 is not None
-            hit_p += hp
-            hit_d1 += hd1
-            hit_d2 += hd2
-            hit_all += (hp and hd1 and hd2)
+            hit_p += hp; hit_d1 += hd1; hit_d2 += hd2; hit_all += (hp and hd1 and hd2)
 
         total = len(idxs)
         def pct(x): return f"{x/total*100:.1f}%"
@@ -243,8 +257,10 @@ class DataModule:
             ds, batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
             prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last,
-            collate_fn=lambda b: (torch.stack([x[0] for x in b]), torch.stack([x[1] for x in b]),
-                                  torch.stack([x[2] for x in b]), torch.stack([x[3] for x in b]))
+            collate_fn=lambda b: (torch.stack([x[0] for x in b]),
+                                  torch.stack([x[1] for x in b]),
+                                  torch.stack([x[2] for x in b]),
+                                  torch.stack([x[3] for x in b]))
         )
 
     def test_loader(self) -> DataLoader:
@@ -253,6 +269,8 @@ class DataModule:
             ds, batch_size=self.cfg.batch_size, shuffle=False, num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
             prefetch_factor=self.cfg.prefetch_factor, drop_last=False,
-            collate_fn=lambda b: (torch.stack([x[0] for x in b]), torch.stack([x[1] for x in b]),
-                                  torch.stack([x[2] for x in b]), torch.stack([x[3] for x in b]))
+            collate_fn=lambda b: (torch.stack([x[0] for x in b]),
+                                  torch.stack([x[1] for x in b]),
+                                  torch.stack([x[2] for x in b]),
+                                  torch.stack([x[3] for x in b]))
         )
