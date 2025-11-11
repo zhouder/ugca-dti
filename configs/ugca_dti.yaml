@@ -9,8 +9,8 @@ data:
   dataset: [DAVIS, BindingDB, BioSNAP]     # 可传命令行 --dataset 覆盖
   folds: [1, 2, 3, 4, 5]
   # 注意：模板里 ${dataset} 用大写，方便你现有的目录
-  train_csv_tmpl: "/root/lanyun-tmp/${dataset}_k5_clean_seed42/fold${fold}_train.csv"
-  test_csv_tmpl:  "/root/lanyun-tmp/${dataset}_k5_clean_seed42/fold${fold}_test.csv"
+  train_csv_tmpl: "/root/lanyun-tmp/${dataset}/fold${fold}_train.csv"
+  test_csv_tmpl:  "/root/lanyun-tmp/${dataset}/fold${fold}_test.csv"
 
   # DataLoader
   batch_size: 128          # 1D特征（mean pooling 后）很小，可以用大batch提速
