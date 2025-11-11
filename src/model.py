@@ -131,10 +131,31 @@ class UGCAModel(nn.Module):
 class TokenGate(nn.Module):
     """给每个 token 产生一个门控 g∈(0,1)"""
     def __init__(self, d: int):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
+        super().__init__(); self.mlp = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.mlp(x))  # (B,T,1)
+
+class EvidentialTokenGate(nn.Module):
+    """
+    基于 Normal-Inverse-Gamma 的证据门控：
+      x -> (mu, v, alpha, beta) 经 softplus 约束；以“epistemic 方差”抑制置信：
+        Var_ep = beta / (v * (alpha - 1))
+        g = sigmoid(mu) * exp(-lam * Var_ep)
+    """
+    def __init__(self, d: int, lam: float = 2.0, eps: float = 1e-6):
+        super().__init__()
+        self.proj = nn.Linear(d, 4, bias=True)
+        self.lam = float(lam)
+        self.eps = float(eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.proj(x)                    # (B,T,4)
+        mu, v_raw, a_raw, b_raw = torch.chunk(h, 4, dim=-1)
+        v = F.softplus(v_raw) + self.eps    # >0
+        alpha = F.softplus(a_raw) + 1.0 + self.eps
+        beta  = F.softplus(b_raw) + self.eps
+        var_ep = beta / (v * (alpha - 1.0))
+        g = torch.sigmoid(mu) * torch.exp(-self.lam * var_ep)
+        return g.clamp_min(1e-6)            # (B,T,1)
 
 class GatedCrossAttn(nn.Module):
     """
@@ -143,7 +164,8 @@ class GatedCrossAttn(nn.Module):
       attn_xy  = softmax(score_xy)
       out_x    = attn_xy Vy
     """
-    def __init__(self, d: int, nhead: int = 4, dropout: float = 0.1):
+    def __init__(self, d: int, nhead: int = 4, dropout: float = 0.1,
+                 gate_type: str = "evidential", gate_lambda: float = 2.0):
         super().__init__()
         assert d % nhead == 0
         self.d, self.h = d, nhead
@@ -154,8 +176,13 @@ class GatedCrossAttn(nn.Module):
         self.qy = nn.Linear(d, d, bias=False)
         self.ky = nn.Linear(d, d, bias=False)
         self.vy = nn.Linear(d, d, bias=False)
-        self.gx = TokenGate(d)
-        self.gy = TokenGate(d)
+        # 门控类型
+        if (gate_type or "evidential").lower().startswith("evi"):
+            self.gx = EvidentialTokenGate(d, lam=gate_lambda)
+            self.gy = EvidentialTokenGate(d, lam=gate_lambda)
+        else:
+            self.gx = TokenGate(d)
+            self.gy = TokenGate(d)
         self.out_x = nn.Linear(d, d, bias=False)
         self.out_y = nn.Linear(d, d, bias=False)
         self.dropout = nn.Dropout(dropout)
@@ -234,6 +261,10 @@ class SeqCfg:
     mutan_dim: int = 512
     mutan_rank: int = 10
     head_hidden: int = 512
+    # 门控
+    gate_type: str = "evidential"   # evidential | mlp
+    gate_lambda: float = 2.0        # 不确定性抑制系数 λ
+    topk_ratio: float = 0.0         # >0 启用逐层 top-k 稀疏门控
 
 class UGCASeqModel(nn.Module):
     """
@@ -252,7 +283,12 @@ class UGCASeqModel(nn.Module):
         self.proj_d = nn.Linear(cfg.d_molclr,  d, bias=False)
         self.proj_c = nn.Linear(cfg.d_chem,    d, bias=False)
         # 门控 cross-attn 层堆叠
-        self.layers = nn.ModuleList([GatedCrossAttn(d=d, nhead=cfg.nhead, dropout=cfg.dropout) for _ in range(cfg.nlayers)])
+        self.layers = nn.ModuleList([
+            GatedCrossAttn(d=d, nhead=cfg.nhead, dropout=cfg.dropout,
+                           gate_type=cfg.gate_type, gate_lambda=cfg.gate_lambda)
+            for _ in range(cfg.nlayers)
+        ])
+        self.topk_ratio = float(getattr(cfg, "topk_ratio", 0.0))
         # MUTAN + 头
         self.mutan = Mutan(dx=d, dy=d, dz=cfg.mutan_dim, rank=cfg.mutan_rank, dropout=cfg.dropout, act="tanh")
         self.head = nn.Sequential(
@@ -280,10 +316,32 @@ class UGCASeqModel(nn.Module):
         P = self.proj_p(v_prot)                                   # (B,M,d)
         D = self.proj_d(v_mol) + self.proj_c(v_chem).unsqueeze(1) # (B,N,d) + broadcast
 
-        # 2) 多层门控 cross-attn
+        # 2) 多层门控 cross-attn（可选逐层 top-k 稀疏门控）
         gd = gp = None
-        for layer in self.layers:
+        for li, layer in enumerate(self.layers):
             D, P, gd, gp = layer(D, m_mol, P, m_prot)             # D<->P
+            if self.topk_ratio > 0.0:
+                # 逐层更新 mask：保留门控较大的 token
+                with torch.no_grad():
+                    def _update_mask(g: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+                        # g:(B,T) m:(B,T)[bool]
+                        B, T = g.shape
+                        new_m = m.clone()
+                        for i in range(B):
+                            valid = torch.nonzero(m[i], as_tuple=False).squeeze(-1)
+                            if valid.numel() == 0:
+                                continue
+                            k = max(1, int(valid.numel() * self.topk_ratio + 1e-6))
+                            vals = g[i, valid]
+                            topk = torch.topk(vals, k=min(k, valid.numel()), largest=True).indices
+                            keep = valid[topk]
+                            nm = torch.zeros_like(m[i])
+                            nm[keep] = True
+                            new_m[i] = nm
+                        return new_m
+                    m_mol = _update_mask(gd, m_mol)
+                    m_prot = _update_mask(gp, m_prot)
+
         self._last_gd, self._last_gp = gd, gp                     # (B,N), (B,M)
 
         # 3) 池化 + MUTAN + 分类
@@ -295,6 +353,13 @@ class UGCASeqModel(nn.Module):
 
     def last_gates(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self._last_gd, self._last_gp
+
+    # 两阶段训练：冻结/解冻门控
+    def freeze_gating(self, freeze: bool = True):
+        for layer in self.layers:
+            for mod in (layer.gx, layer.gy):
+                for p in mod.parameters():
+                    p.requires_grad = (not freeze)
 
 # ====== 工厂函数（训练脚本优先调用）======
 def build_model(cfg: Dict) -> nn.Module:
@@ -314,6 +379,9 @@ def build_model(cfg: Dict) -> nn.Module:
             mutan_rank=int(cfg.get("mutan_rank", 10)),
             mutan_dim=int(cfg.get("mutan_dim", 512)),
             head_hidden=int(cfg.get("head_hidden", 512)),
+            gate_type=str(cfg.get("gate_type", "evidential")),
+            gate_lambda=float(cfg.get("gate_lambda", 2.0)),
+            topk_ratio=float(cfg.get("topk_ratio", 0.0)),
         )
         return UGCASeqModel(mcfg)
     else:
