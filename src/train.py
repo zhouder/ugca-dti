@@ -28,15 +28,24 @@ except Exception:
 # ---------- metrics ----------
 def compute_metrics(prob: np.ndarray, y_true: np.ndarray, thr: float = 0.5) -> Dict[str, float]:
     out: Dict[str, float] = {}
-    pred = (prob >= thr).astype(np.int64)
-    out["acc"] = float(accuracy_score(y_true, pred)) if SKLEARN else float((pred == y_true).mean())
-    out["sen"] = float(recall_score(y_true, pred))    if SKLEARN else float((pred[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0)
-    out["f1"]  = float(f1_score(y_true, pred))        if SKLEARN else float("nan")
-    out["mcc"] = float(matthews_corrcoef(y_true, pred)) if SKLEARN else float("nan")
-    try:    out["auroc"] = float(roc_auc_score(y_true, prob)) if SKLEARN else float("nan")
-    except Exception: out["auroc"] = float("nan")
-    try:    out["auprc"] = float(average_precision_score(y_true, prob)) if SKLEARN else float("nan")
-    except Exception: out["auprc"] = float("nan")
+    if SKLEARN:
+        pred = (prob >= thr).astype(np.int64)
+        out["acc"] = float(accuracy_score(y_true, pred))
+        out["sen"] = float(recall_score(y_true, pred))
+        out["f1"]  = float(f1_score(y_true, pred))
+        out["mcc"] = float(matthews_corrcoef(y_true, pred))
+        try:    out["auroc"] = float(roc_auc_score(y_true, prob))
+        except Exception: out["auroc"] = float("nan")
+        try:    out["auprc"] = float(average_precision_score(y_true, prob))
+        except Exception: out["auprc"] = float("nan")
+    else:
+        pred = (prob >= thr).astype(np.int64)
+        out["acc"] = float((pred == y_true).mean())
+        out["sen"] = float((pred[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0)
+        out["f1"]  = float("nan")
+        out["mcc"] = float("nan")
+        out["auroc"] = float("nan")
+        out["auprc"] = float("nan")
     return out
 
 def fmt1(m: Dict[str, float]) -> str:
@@ -124,6 +133,7 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, opti
         logits, y = _forward_any(model, batch)
         loss = bce(logits, y)
 
+        # 门控预算正则（若模型实现了 last_gates 钩子）
         if gate_budget > 0.0 and hasattr(model, "last_gates"):
             gd, gp = model.last_gates()
             if gd is not None and gp is not None:
@@ -189,6 +199,12 @@ def parse_args():
     ap.add_argument("--overall-val",   type=float, default=0.1)
     ap.add_argument("--thr", default="auto",
                     help="决策阈值；'auto'=在验证集上选择使F1最大的阈值；或显式给出如 0.35")
+
+    # —— 新增：稳定命名 & 断点续训 —— #
+    ap.add_argument("--out-dir", default="",
+                    help="可选：自定义输出根目录；不设则默认 /root/lanyun-tmp/ugca-runs/<DATASET>-cold-{protein|drug}[-seq][-suffix]")
+    ap.add_argument("--suffix", default="", help="可选：给目录添加自定义后缀，如 '-seq'、'-s42'")
+    ap.add_argument("--resume", action="store_true", help="断点续训：已完成的折自动跳过；存在 last.pth 时从其 epoch+1 继续")
     return ap.parse_args()
 
 # ---------- helpers for split ----------
@@ -248,10 +264,14 @@ if __name__ == "__main__":
     print(f"[SPLIT] 模式={args.split_mode} | 折数={len(outer_splits)} | 目标整体比例 train:val:test = {args.overall_train}:{args.overall_val}:{overall_test:.1f}")
     print(f"[SPLIT] 实施策略：每折 test=1/5；在其余 4/5 的候选池按组随机抽取 {val_frac_in_pool*100:.1f}% 的组做 val，其余做 train（保持组不交叠）")
 
-    # ---- 输出主目录（自动命名）----
-    tstamp = time.strftime("%Y%m%d-%H%M%S")
-    split_tag = ("cprotein" if args.split_mode == "cold-protein" else "cdrug")
-    out_dir = Path("/root/lanyun-tmp/ugca-runs") / f"{ds_cap}-{split_tag}-k{len(outer_splits)}-r{int(args.overall_train*100)}-{int(args.overall_val*100)}-{int(overall_test*100)}-s{args.seed}-{tstamp}"
+    # ---- 输出主目录（稳定命名，不含时间戳）----
+    split_tag = "cold-protein" if args.split_mode == "cold-protein" else "cold-drug"
+    base = args.out_dir if args.out_dir else f"/root/lanyun-tmp/ugca-runs/{ds_cap}-{split_tag}"
+    if args.sequence:
+        base += "-seq"
+    if args.suffix:
+        base += (args.suffix if args.suffix.startswith("-") else f"-{args.suffix}")
+    out_dir = Path(base)
     out_dir.mkdir(parents=True, exist_ok=True)
     print("[OUT]", out_dir)
 
@@ -295,7 +315,16 @@ if __name__ == "__main__":
         fold_dir = out_dir / f"fold{t}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         ckpt_best = fold_dir / "best.pth"
+        ckpt_last = fold_dir / "last.pth"
         csv_path  = fold_dir / "metrics.csv"
+
+        # 断点续训：若 summary.csv 存在 → 视为该折完成；否则若 last.pth 存在 → 从其 epoch+1 继续
+        if args.resume:
+            if (fold_dir / "summary.csv").exists():
+                print(f"[RESUME] fold{t} 已完成，跳过。")
+                test_metrics_all.append({k: float("nan") for k in ["auroc","auprc","f1","acc","sen","mcc"]})
+                continue
+
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["epoch","train_loss","val_loss","AUROC","AUPRC","F1","ACC","SEN","MCC","time_train_s","time_val_s","thr"])
@@ -304,8 +333,24 @@ if __name__ == "__main__":
         best_epoch = -1
         best_metrics = {}
         best_thr = 0.5
+        start_epoch = 1
 
-        for ep in range(1, args.epochs + 1):
+        if args.resume and ckpt_last.exists():
+            sd = torch.load(str(ckpt_last), map_location="cpu")
+            try:
+                model.load_state_dict(sd["state_dict"])
+                if "optimizer" in sd and sd["optimizer"]:
+                    optimizer.load_state_dict(sd["optimizer"])
+            except Exception:
+                pass
+            start_epoch = int(sd.get("epoch", 0)) + 1
+            best_thr    = float(sd.get("best_thr", best_thr))
+            best_score  = float(sd.get("best_score", best_score))
+            best_epoch  = int(sd.get("best_epoch", best_epoch))
+            best_metrics= sd.get("best_metrics", best_metrics)
+            print(f"[RESUME] fold{t} 从 epoch {start_epoch} 继续")
+
+        for ep in range(start_epoch, args.epochs + 1):
             tr_loss, tr_t = train_epoch(model, train_loader, device, optimizer,
                                         tag=f"{ds_lower}/train/fold{t}", ep=ep, ep_total=args.epochs,
                                         gate_budget=args.gate_budget, gate_rho=args.gate_rho)
@@ -329,6 +374,17 @@ if __name__ == "__main__":
                 best_thr    = float(thr_now)
                 torch.save({"epoch": ep, "state_dict": model.state_dict(),
                             "metrics": m, "optimizer": optimizer.state_dict()}, str(ckpt_best))
+
+            # 保存 last.pth（每个 epoch 都覆盖）
+            torch.save({
+                "epoch": ep,
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "best_thr": best_thr,
+                "best_score": best_score,
+                "best_epoch": best_epoch,
+                "best_metrics": best_metrics,
+            }, str(ckpt_last))
 
         print(f"[VAL/fold{t}] best@epoch={best_epoch} | thr*={best_thr:.4f} | {fmt1(best_metrics)}")
 
@@ -356,5 +412,6 @@ if __name__ == "__main__":
     std  = {k: float(np.std ([m[k] for m in test_metrics_all])) for k in keys}
     with open(out_dir / "cv_summary.csv", "w", newline="") as f:
         w = csv.writer(f); w.writerow(["metric","mean","std"])
+        for k in keys: w.writerow([k.upper()],)
         for k in keys: w.writerow([k.upper(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
     print("[CV] " + " | ".join([f"{k.upper()} {mean[k]:.4f}±{std[k]:.4f}" for k in keys]))
