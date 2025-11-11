@@ -1,7 +1,7 @@
 # src/train.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, time, math, argparse, importlib, inspect, csv, json
+import os, time, math, argparse, importlib, csv
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -20,50 +20,64 @@ try:
         roc_auc_score, average_precision_score, f1_score,
         accuracy_score, recall_score, matthews_corrcoef
     )
+
     SKLEARN = True
 except Exception:
     SKLEARN = False
     print("[WARN] scikit-learn 不可用，将退化到少量指标。")
 
+
 def compute_metrics(prob: np.ndarray, y_true: np.ndarray, thr: float = 0.5) -> Dict[str, float]:
     out: Dict[str, float] = {}
     pred = (prob >= thr).astype(np.int64)
     out["acc"] = float(accuracy_score(y_true, pred)) if SKLEARN else float((pred == y_true).mean())
-    out["sen"] = float(recall_score(y_true, pred))    if SKLEARN else float((pred[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0)
-    out["f1"]  = float(f1_score(y_true, pred))        if SKLEARN else float("nan")
+    out["sen"] = float(recall_score(y_true, pred)) if SKLEARN else float(
+        (pred[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0)
+    out["f1"] = float(f1_score(y_true, pred)) if SKLEARN else float("nan")
     out["mcc"] = float(matthews_corrcoef(y_true, pred)) if SKLEARN else float("nan")
-    try:    out["auroc"] = float(roc_auc_score(y_true, prob)) if SKLEARN else float("nan")
-    except Exception: out["auroc"] = float("nan")
-    try:    out["auprc"] = float(average_precision_score(y_true, prob)) if SKLEARN else float("nan")
-    except Exception: out["auprc"] = float("nan")
+    try:
+        out["auroc"] = float(roc_auc_score(y_true, prob)) if SKLEARN else float("nan")
+    except Exception:
+        out["auroc"] = float("nan")
+    try:
+        out["auprc"] = float(average_precision_score(y_true, prob)) if SKLEARN else float("nan")
+    except Exception:
+        out["auprc"] = float("nan")
     return out
 
+
 def find_best_threshold(prob: np.ndarray, y_true: np.ndarray, step: float = 0.01,
-                        thr_min: float = 0.0, thr_max: float = 1.0) -> Tuple[float, Dict[str,float]]:
-    """Grid search best threshold for F1 on (prob, y_true)."""
+                        thr_min: float = 0.0, thr_max: float = 1.0) -> Tuple[float, Dict[str, float]]:
     best_thr = 0.5
     best_val = -1.0
     best_metrics = None
+    thr_min = max(0.0, thr_min);
+    thr_max = min(1.0, thr_max)
     thr = float(thr_min)
-    # ensure bounds sane
-    thr_min = max(0.0, thr_min); thr_max = min(1.0, thr_max)
     while thr <= thr_max + 1e-12:
         m = compute_metrics(prob, y_true, thr=thr)
         val = m.get("f1", float("nan"))
         if not np.isnan(val) and val > best_val:
-            best_val = val
-            best_thr = float(thr)
-            best_metrics = m
+            best_val, best_thr, best_metrics = val, float(thr), m
         thr += step
     if best_metrics is None:
         best_metrics = compute_metrics(prob, y_true, thr=0.5)
         best_thr = 0.5
     return best_thr, best_metrics
 
+
 def fmt1(m: Dict[str, float]) -> str:
-    return (f"AUROC {m['auroc']:>7.4f} | AUPRC {m['auprc']:>7.4f} | "
-            f"F1 {m['f1']:>7.4f} | ACC {m['acc']:>7.4f} | "
-            f"SEN {m['sen']:>7.4f} | MCC {m['mcc']:>7.4f}")
+    def g(k):
+        v = m.get(k, float("nan"))
+        try:
+            return f"{v:>7.4f}"
+        except Exception:
+            return "   nan"
+
+    return (f"AUROC {g('auroc')} | AUPRC {g('auprc')} | "
+            f"F1 {g('f1')} | ACC {g('acc')} | "
+            f"SEN {g('sen')} | MCC {g('mcc')}")
+
 
 # =============== model loader ===============
 def build_model_from_src(dims: CacheDims, args) -> nn.Module:
@@ -72,9 +86,9 @@ def build_model_from_src(dims: CacheDims, args) -> nn.Module:
         print("[Model] 使用 src.model.build_model(cfg)")
         cfg = {
             "d_protein": int(dims.esm2),
-            "d_molclr":  int(dims.molclr),
-            "d_chem":    int(dims.chemberta),
-            "d_model":   args.d_model, "dropout": args.dropout, "act": "silu",
+            "d_molclr": int(dims.molclr),
+            "d_chem": int(dims.chemberta),
+            "d_model": args.d_model, "dropout": args.dropout, "act": "silu",
             "mutan_rank": args.mutan_rank, "mutan_dim": args.mutan_dim, "head_hidden": args.head_hidden,
             # V2
             "sequence": bool(args.sequence),
@@ -85,7 +99,7 @@ def build_model_from_src(dims: CacheDims, args) -> nn.Module:
             "gate_lambda": args.gate_lambda,
             "g_min": args.g_min,
             "smooth_g": args.smooth_g,
-            "topk_ratio": 0.0,  # 训练时动态 warm-up
+            "topk_ratio": 0.0,
             # Cross-attn
             "attn_temp": args.attn_temp,
             # Pooling
@@ -96,6 +110,7 @@ def build_model_from_src(dims: CacheDims, args) -> nn.Module:
         return getattr(model_mod, "build_model")(cfg)
     raise RuntimeError("在 src/model.py 中没找到 build_model(cfg)。")
 
+
 # =============== losses ===============
 class FocalLoss(nn.Module):
     def __init__(self, gamma: float = 2.0, alpha: float = 0.25, reduction: str = "mean"):
@@ -103,6 +118,7 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
         self.alpha = alpha
         self.reduction = reduction
+
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         prob = torch.sigmoid(logits)
         pt = prob * targets + (1 - prob) * (1 - targets)
@@ -115,44 +131,53 @@ class FocalLoss(nn.Module):
         else:
             return loss
 
+
 def make_criterion(args, device: torch.device, train_csv: str):
     if args.loss_type == "focal":
         return FocalLoss(gamma=args.focal_gamma, alpha=args.focal_alpha)
     elif args.loss_type == "bce_weighted":
-        # 读取 CSV 估计 pos_weight = neg/pos
         pos, neg = 0, 0
         with open(train_csv, "r", encoding="utf-8", newline="") as f:
             rd = csv.reader(f)
             header = next(rd, None)
-            si = 2 if (header and len(header)>=3 and header[2].strip().lower()=="label") else None
-            if header and si is None:
+            if header and header[0].lower() == "drug":
+                pass
+            else:
                 try:
-                    val = float(header[2]); pos += (val >= 0.5); neg += (val < 0.5)
+                    val = float(header[2]);
+                    pos += (val >= 0.5);
+                    neg += (val < 0.5)
                 except Exception:
                     pass
             for row in rd:
                 if not row: continue
                 try:
                     val = float(row[2])
-                    if val >= 0.5: pos += 1
-                    else: neg += 1
+                    if val >= 0.5:
+                        pos += 1
+                    else:
+                        neg += 1
                 except Exception:
                     continue
-        pw = (neg / max(1, pos)) if pos>0 else 1.0
+        pw = (neg / max(1, pos)) if pos > 0 else 1.0
         print(f"[LOSS] BCEWithLogitsLoss(pos_weight={pw:.2f})  (pos={pos},neg={neg})")
         return nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], dtype=torch.float32, device=device))
     else:
         return nn.BCEWithLogitsLoss()
 
+
 # =============== schedulers ===============
 def build_warmup_cosine(optimizer, total_epochs: int, warmup_ratio: float = 0.05):
     warmup_epochs = max(1, int(total_epochs * warmup_ratio))
+
     def lr_lambda(current_epoch):
         if current_epoch < warmup_epochs:
             return float(current_epoch + 1) / float(warmup_epochs)
         progress = (current_epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     return LambdaLR(optimizer, lr_lambda)
+
 
 # =============== train/test epoch ===============
 def _batch_to_device(batch, device):
@@ -173,6 +198,7 @@ def _batch_to_device(batch, device):
     else:
         raise RuntimeError(f"Unknown batch format len={len(batch)}")
 
+
 def _forward_any(model: nn.Module, batch_tensors, topk_ratio: Optional[float] = None):
     if len(batch_tensors) == 4:
         v1, v2, v3, y = batch_tensors
@@ -183,6 +209,7 @@ def _forward_any(model: nn.Module, batch_tensors, topk_ratio: Optional[float] = 
         logits = model(P, Pm, D, Dm, C, topk_ratio=topk_ratio)
         return logits, y
 
+
 def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
                 optimizer: optim.Optimizer, criterion: nn.Module,
                 tag: str, ep: int, ep_total: int,
@@ -191,44 +218,39 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
                 amp: bool = True, scaler: Optional["torch.cuda.amp.GradScaler"] = None,
                 topk_ratio: float = 0.0) -> Tuple[float, float]:
     model.train(True)
-    tot = 0.0
-    n_seen = 0
+    tot = 0.0;
+    n_seen = 0;
     t0 = time.time()
-
     total_samples = len(loader.dataset)
     pbar = tqdm(total=total_samples, ncols=120, unit="ex",
                 desc=f"[{tag}] epoch {ep}/{ep_total}", leave=True, position=0)
 
     for batch in loader:
         batch = _batch_to_device(batch, device)
-        ctx = torch.cuda.amp.autocast(enabled=amp and device.type=="cuda")
+        ctx = torch.cuda.amp.autocast(enabled=amp and device.type == "cuda")
         with ctx:
             logits, y = _forward_any(model, batch, topk_ratio=topk_ratio)
             loss = criterion(logits, y)
-
-            # 门控预算正则（仅 V2 生效）
             if gate_budget > 0.0 and hasattr(model, "last_gates"):
                 gd, gp = model.last_gates()
                 if gd is not None and gp is not None:
                     def _mean1d(g): return g.mean(dim=1).mean()
+
                     Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
                     loss = loss + gate_budget * Lb
-
-            # Evidential 正则（简化 proxy）
             if evi_reg_lambda > 0.0 and hasattr(model, "_last_gd") and model._last_gd is not None:
                 proxy = 1.0 - (model._last_gd.mean() + model._last_gp.mean()) * 0.5
                 loss = loss + evi_reg_lambda * proxy
-
-            # 注意力熵正则
             if entropy_reg_lambda > 0.0 and hasattr(model, "_last_entropy"):
                 loss = loss + entropy_reg_lambda * model._last_entropy
 
         optimizer.zero_grad(set_to_none=True)
-        if amp and scaler is not None and device.type=="cuda":
+        if amp and scaler is not None and device.type == "cuda":
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer); scaler.update()
+            scaler.step(optimizer);
+            scaler.update()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -240,16 +262,16 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
         pbar.update(bs)
         if n_seen and (n_seen % (bs * 10) == 0 or n_seen == total_samples):
             pbar.set_postfix_str(f"{n_seen}/{total_samples} ex | loss {tot * 1.0 / (n_seen / bs):.4f}")
-
     pbar.close()
     return tot / max(1, n_seen / bs), time.time() - t0
 
-def test_epoch(model: nn.Module, loader: DataLoader, device: torch.device, criterion: nn.Module) -> Tuple[float, np.ndarray, np.ndarray, float]:
-    model.train(False)
-    tot = 0.0
-    probs, labels = [], []
-    t0 = time.time()
 
+def test_epoch(model: nn.Module, loader: DataLoader, device: torch.device, criterion: nn.Module) -> Tuple[
+    float, np.ndarray, np.ndarray, float]:
+    model.train(False)
+    tot = 0.0;
+    probs, labels = [], [];
+    t0 = time.time()
     for batch in loader:
         batch = _batch_to_device(batch, device)
         with torch.no_grad():
@@ -258,25 +280,61 @@ def test_epoch(model: nn.Module, loader: DataLoader, device: torch.device, crite
         tot += float(loss.detach().cpu())
         probs.append(torch.sigmoid(logits).detach().cpu().numpy())
         labels.append(y.detach().cpu().numpy())
-
     prob = np.concatenate(probs, axis=0) if probs else np.zeros((0,), dtype=np.float32)
-    lab  = np.concatenate(labels, axis=0) if labels else np.zeros((0,), dtype=np.float32)
+    lab = np.concatenate(labels, axis=0) if labels else np.zeros((0,), dtype=np.float32)
     return tot / max(1, len(loader)), prob, lab, time.time() - t0
 
-def save_ckpt(path: Path, model: nn.Module, epoch: int, metrics: Dict[str,float], opt_state: Dict):
+
+def save_ckpt(path: Path, model: nn.Module, epoch: int, metrics: Dict[str, float], opt_state: Dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"epoch": epoch, "state_dict": model.state_dict(),
                 "metrics": metrics, "optimizer": opt_state}, str(path))
 
+
+# =============== helpers for global resume ===============
+def load_ckpt_epoch(ckpt_path: Path) -> int:
+    if ckpt_path.exists():
+        try:
+            state = torch.load(str(ckpt_path), map_location="cpu")
+            return int(state.get("epoch", 0))
+        except Exception:
+            return 0
+    return 0
+
+
+def csv_last_best(csv_path: Path) -> Dict[str, float]:
+    if not csv_path.exists():
+        return {k: float("nan") for k in ["auroc", "auprc", "f1", "acc", "sen", "mcc"]}
+    try:
+        import pandas as pd
+        df = pd.read_csv(str(csv_path))
+        best_rows = df[df["epoch"].astype(str).str.startswith("best@")]
+        if len(best_rows) > 0:
+            r = best_rows.iloc[-1].to_dict()
+        else:
+            df2 = df[pd.to_numeric(df["epoch"], errors="coerce").notna()]
+            r = df2.iloc[-1].to_dict() if len(df2) > 0 else {}
+        return {
+            "auroc": float(r.get("AUROC", float("nan"))),
+            "auprc": float(r.get("AUPRC", float("nan"))),
+            "f1": float(r.get("F1", float("nan"))),
+            "acc": float(r.get("ACC", float("nan"))),
+            "sen": float(r.get("SEN", float("nan"))),
+            "mcc": float(r.get("MCC", float("nan"))),
+        }
+    except Exception:
+        return {k: float("nan") for k in ["auroc", "auprc", "f1", "acc", "sen", "mcc"]}
+
+
 # =============== one fold ===============
 def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
     ds_lower = args.dataset.lower()
-    ds_cap   = {"bindingdb":"BindingDB", "davis":"DAVIS", "biosnap":"BioSNAP"}.get(ds_lower, args.dataset)
+    ds_cap = {"bindingdb": "BindingDB", "davis": "DAVIS", "biosnap": "BioSNAP"}.get(ds_lower, args.dataset)
     data_root = Path(args.data_root)
 
-    csv_dir   = data_root / args.dataset_dirname
+    csv_dir = data_root / args.dataset_dirname
     train_csv = str(csv_dir / f"fold{fold}_train.csv")
-    test_csv  = str(csv_dir / f"fold{fold}_test.csv")
+    test_csv = str(csv_dir / f"fold{fold}_test.csv")
 
     print(f"=== dataset: {ds_lower} fold: {fold} ===")
     print("[paths] train =", train_csv)
@@ -284,9 +342,9 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
 
     cache_root = data_root / "cache"
     cache_dirs = CacheDirs(
-        esm2_dir      = str(cache_root / "esm"       / ds_cap),
-        molclr_dir    = str(cache_root / "molclr"    / ds_cap),
-        chemberta_dir = str(cache_root / "chemberta" / ds_cap),
+        esm2_dir=str(cache_root / "esm" / ds_cap),
+        molclr_dir=str(cache_root / "molclr" / ds_cap),
+        chemberta_dir=str(cache_root / "chemberta" / ds_cap),
     )
     dims = CacheDims(esm2=args.d_protein, molclr=args.d_molclr, chemberta=args.d_chem)
 
@@ -294,7 +352,7 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
         DMConfig(
             train_csv=train_csv, test_csv=test_csv,
             num_workers=args.workers, batch_size=args.batch_size,
-            pin_memory=True, persistent_workers=args.workers>0,
+            pin_memory=True, persistent_workers=args.workers > 0,
             prefetch_factor=2, drop_last=False,
             sequence=args.sequence
         ),
@@ -302,13 +360,14 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
     )
 
     train_loader = dm.train_loader()
-    test_loader  = dm.test_loader()
+    test_loader = dm.test_loader()
     N = len(train_loader.dataset)
     print(f"[INFO] train size = {N} | batch_size = {args.batch_size} | sequence={args.sequence}")
 
     model = build_model_from_src(dims, args).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = build_warmup_cosine(optimizer, total_epochs=args.epochs, warmup_ratio=args.warmup_ratio) if args.scheduler == "cosine" else None
+    scheduler = build_warmup_cosine(optimizer, total_epochs=args.epochs,
+                                    warmup_ratio=args.warmup_ratio) if args.scheduler == "cosine" else None
     criterion = make_criterion(args, device, train_csv)
 
     fold_dir = Path(args.out) / f"fold{fold}"
@@ -317,15 +376,16 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
     if not csv_path.exists():
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            # include best-thr columns if auto
             if args.auto_thr:
-                w.writerow(["epoch","train_loss","test_loss","AUROC","AUPRC","F1","ACC","SEN","MCC",
-                            "THR_BEST","F1_BEST","ACC_BEST","SEN_BEST","MCC_BEST",
-                            "time_train_s","time_test_s"])
+                w.writerow(["epoch", "train_loss", "test_loss", "AUROC", "AUPRC", "F1", "ACC", "SEN", "MCC",
+                            "THR_BEST", "F1_BEST", "ACC_BEST", "SEN_BEST", "MCC_BEST",
+                            "time_train_s", "time_test_s"])
             else:
-                w.writerow(["epoch","train_loss","test_loss","AUROC","AUPRC","F1","ACC","SEN","MCC","time_train_s","time_test_s"])
+                w.writerow(
+                    ["epoch", "train_loss", "test_loss", "AUROC", "AUPRC", "F1", "ACC", "SEN", "MCC", "time_train_s",
+                     "time_test_s"])
 
-    # resume (shape-safe loading optional)
+    # ===== resume for this fold (shape-safe) =====
     start_epoch = 1
     last_ckpt = fold_dir / "last.pth"
     if args.resume and Path(args.resume).exists():
@@ -334,8 +394,10 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
         msd = model.state_dict()
         sd = {k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}
         model.load_state_dict(sd, strict=False)
-        try: optimizer.load_state_dict(state.get("optimizer", {}))
-        except Exception: pass
+        try:
+            optimizer.load_state_dict(state.get("optimizer", {}))
+        except Exception:
+            pass
         start_epoch = int(state.get("epoch", 0)) + 1
         print(f"[RESUME] loaded {args.resume} -> start_epoch={start_epoch} (matched {len(sd)} keys)")
     elif last_ckpt.exists():
@@ -344,35 +406,41 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
         msd = model.state_dict()
         sd = {k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}
         model.load_state_dict(sd, strict=False)
-        try: optimizer.load_state_dict(state.get("optimizer", {}))
-        except Exception: pass
+        try:
+            optimizer.load_state_dict(state.get("optimizer", {}))
+        except Exception:
+            pass
         start_epoch = int(state.get("epoch", 0)) + 1
         print(f"[RESUME] auto loaded {last_ckpt} -> start_epoch={start_epoch} (matched {len(sd)} keys)")
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type=="cuda")
+    if start_epoch > args.epochs:
+        print(f"[SKIP] fold{fold}: already reached epoch {start_epoch - 1} >= target {args.epochs}. Skipping.")
+        best_row = csv_last_best(csv_path)
+        print(f"[{ds_lower}] fold{fold} best | {fmt1(best_row)} (epoch>= {args.epochs})")
+        return best_row
+
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     # Stage-A/B gating control
     if hasattr(model, "set_gate_enabled"):
-        model.set_gate_enabled(False if (args.stage=="ab" and args.stage_a_epochs>0) else True)
-    if hasattr(model, "freeze_gating") and args.stage=="ab":
-        model.freeze_gating(False)  # stage-A: allow other parts to learn
+        model.set_gate_enabled(False if (args.stage == "ab" and args.stage_a_epochs > 0) else True)
+    if hasattr(model, "freeze_gating") and args.stage == "ab":
+        model.freeze_gating(False)
 
     best_score = -1.0
-    best_row: Dict[str,float] = {}
+    best_row: Dict[str, float] = {}
     best_epoch = -1
-    last_k_states = []  # for averaging last K
+    last_k_states = []
 
     for ep in range(start_epoch, args.epochs + 1):
-        # Toggle stage
         if args.stage == "ab" and args.stage_a_epochs > 0 and ep == args.stage_a_epochs + 1:
             if hasattr(model, "set_gate_enabled"):
-                model.set_gate_enabled(True)
+                model.set_gate_enabled(True);
                 print("[STAGE] switch to Stage-B: enable gating")
             if hasattr(model, "freeze_gating"):
-                model.freeze_gating(True)  # freeze gate params in Stage-B
+                model.freeze_gating(True);
                 print("[STAGE] freeze gating params")
 
-        # Top-k warmup (linearly from 0 -> target during Stage-B)
         ratio_eff = 0.0
         if args.topk_ratio > 0.0 and hasattr(model, "topk_ratio"):
             if args.stage == "ab" and ep <= args.stage_a_epochs:
@@ -389,15 +457,10 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
                                     amp=args.amp, scaler=scaler, topk_ratio=ratio_eff)
         te_loss, prob, y, te_t = test_epoch(model, test_loader, device, criterion)
 
-        # metrics @ fixed thr
         m = compute_metrics(prob, y, thr=args.thr)
-
-        # auto max-F1 threshold
         if args.auto_thr:
             best_thr, m_best = find_best_threshold(prob, y, step=args.thr_scan_step,
                                                    thr_min=args.thr_min, thr_max=args.thr_max)
-            print(f"[THR] best F1 = {m_best['f1']:.4f} at thr={best_thr:.3f}")
-            # write with extra columns
             with open(csv_path, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([ep, f"{tr_loss:.6f}", f"{te_loss:.6f}",
@@ -406,6 +469,7 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
                             f"{best_thr:.6f}", f"{m_best['f1']:.6f}", f"{m_best['acc']:.6f}",
                             f"{m_best['sen']:.6f}", f"{m_best['mcc']:.6f}",
                             f"{tr_t:.1f}", f"{te_t:.1f}"])
+            print(f"[THR] best F1={m_best['f1']:.4f} at thr={best_thr:.3f}")
         else:
             with open(csv_path, "a", newline="") as f:
                 w = csv.writer(f)
@@ -414,49 +478,33 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
                             f"{m['acc']:.6f}", f"{m['sen']:.6f}", f"{m['mcc']:.6f}",
                             f"{tr_t:.1f}", f"{te_t:.1f}"])
 
-        print(f"[{ds_lower}] fold{fold} ep{ep:03d} | train_loss {tr_loss:.4f} | test_loss {te_loss:.4f} | {fmt1(m)} | time {tr_t:.1f}s/{te_t:.1f}s")
+        print(
+            f"[{ds_lower}] fold{fold} ep{ep:03d} | train_loss {tr_loss:.4f} | test_loss {te_loss:.4f} | {fmt1(m)} | time {tr_t:.1f}s/{te_t:.1f}s")
 
         save_ckpt(fold_dir / "last.pth", model, ep, m, optimizer.state_dict())
-
-        if scheduler is not None:
-            scheduler.step()
+        if scheduler is not None: scheduler.step()
 
         sc = m["auroc"] if not math.isnan(m["auroc"]) else m["acc"]
         if sc > best_score:
-            best_score = sc
-            best_row = dict(m)
-            best_epoch = ep
+            best_score, best_row, best_epoch = sc, dict(m), ep
             save_ckpt(fold_dir / "best.pth", model, ep, m, optimizer.state_dict())
 
-        # for last-K average
         if args.save_last_k > 0:
             last_k_states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
             if len(last_k_states) > args.save_last_k:
                 last_k_states.pop(0)
 
-    # 保存 best 行
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
-        if args.auto_thr:
-            w.writerow([f"best@{best_epoch}", "", "",
-                        f"{best_row.get('auroc', float('nan')):.6f}",
-                        f"{best_row.get('auprc', float('nan')):.6f}",
-                        f"{best_row.get('f1', float('nan')):.6f}",
-                        f"{best_row.get('acc', float('nan')):.6f}",
-                        f"{best_row.get('sen', float('nan')):.6f}",
-                        f"{best_row.get('mcc', float('nan')):.6f}",
-                        "", "", "", "", "", "", ""])
-        else:
-            w.writerow([f"best@{best_epoch}", "", "",
-                        f"{best_row.get('auroc', float('nan')):.6f}",
-                        f"{best_row.get('auprc', float('nan')):.6f}",
-                        f"{best_row.get('f1', float('nan')):.6f}",
-                        f"{best_row.get('acc', float('nan')):.6f}",
-                        f"{best_row.get('sen', float('nan')):.6f}",
-                        f"{best_row.get('mcc', float('nan')):.6f}",
-                        "", ""])
+        w.writerow([f"best@{best_epoch}", "", "",
+                    f"{best_row.get('auroc', float('nan')):.6f}",
+                    f"{best_row.get('auprc', float('nan')):.6f}",
+                    f"{best_row.get('f1', float('nan')):.6f}",
+                    f"{best_row.get('acc', float('nan')):.6f}",
+                    f"{best_row.get('sen', float('nan')):.6f}",
+                    f"{best_row.get('mcc', float('nan')):.6f}",
+                    "", ""])
 
-    # 平均最后 K 个 epoch 权重
     if args.save_last_k > 0 and len(last_k_states) > 0:
         avg_state = {}
         for k in last_k_states[0]:
@@ -468,8 +516,9 @@ def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
     print(f"[{ds_lower}] fold{fold} best | {fmt1(best_row)} (epoch={best_epoch})")
     return best_row
 
-def summarize(rows: List[Dict[str,float]], out_dir: Path):
-    keys = ["auroc","auprc","f1","acc","sen","mcc"]
+
+def summarize(rows: List[Dict[str, float]], out_dir: Path):
+    keys = ["auroc", "auprc", "f1", "acc", "sen", "mcc"]
     fold_best_csv = out_dir / "fold_best.csv"
     with open(fold_best_csv, "w", newline="") as f:
         w = csv.writer(f)
@@ -478,16 +527,18 @@ def summarize(rows: List[Dict[str,float]], out_dir: Path):
             w.writerow([i] + [f"{r.get(k, float('nan')):.6f}" for k in keys])
 
     mean = {k: float(np.nanmean([r.get(k, np.nan) for r in rows])) for k in keys}
-    std  = {k: float(np.nanstd ([r.get(k, np.nan) for r in rows])) for k in keys}
+    std = {k: float(np.nanstd([r.get(k, np.nan) for r in rows])) for k in keys}
     summary_csv = out_dir / "summary.csv"
     with open(summary_csv, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["metric","mean","std"])
+        w = csv.writer(f);
+        w.writerow(["metric", "mean", "std"])
         for k in keys:
             w.writerow([k.upper(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
 
     s = " | ".join([f"{k.upper()} {mean[k]:>7.4f}±{std[k]:<7.4f}" for k in keys])
-    print(f"[SUMMARY over 5 folds] {s}")
+    print(f"[SUMMARY over {len(rows)} folds] {s}")
     return mean, std
+
 
 # =============== CLI ===============
 def parse_args():
@@ -497,17 +548,23 @@ def parse_args():
     ap.add_argument("--dataset-dirname", required=True, help="如 bindingdb / davis / biosnap")
     ap.add_argument("--data-root", required=True, help="如 /root/lanyun-tmp")
     ap.add_argument("--out", required=True, help="如 /root/lanyun-tmp/ugca-runs/dataset")
-    ap.add_argument("--resume", default="", help="可指定 ckpt 路径；为空时自动找 foldX/last.pth")
+    ap.add_argument("--resume", default="", help="可指定 ckpt 路径；为空时自动找 foldX/last.pth（按全局断点策略继续）")
 
     # Train
-    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
-    ap.add_argument("--scheduler", default="cosine", choices=["none","cosine"])
+    ap.add_argument("--scheduler", default="cosine", choices=["none", "cosine"])
     ap.add_argument("--warmup_ratio", type=float, default=0.05)
     ap.add_argument("--amp", action="store_true", help="启用 AMP（3090/4090 推荐）")
+
+    # Folds
+    ap.add_argument("--folds", type=int, default=5, help="折数（默认5）")
+    ap.add_argument("--start-fold", type=int, default=1,
+                    help="从第几折开始（与 --auto-resume 叠加时，只有当自动策略找不到断点才用它）")
+    ap.add_argument("--auto-resume", action="store_true", help="自动从最后进行中的折与轮次继续")
 
     # Model dims
     ap.add_argument("--d-model", type=int, default=512)
@@ -525,8 +582,8 @@ def parse_args():
     ap.add_argument("--nlayers", type=int, default=2)
 
     # Gating
-    ap.add_argument("--gate-type", default="evidential", choices=["evidential","mlp"])
-    ap.add_argument("--gate-mode", default="evi_x_mu", choices=["evi_x_mu","evi_only"])
+    ap.add_argument("--gate-type", default="evidential", choices=["evidential", "mlp"])
+    ap.add_argument("--gate-mode", default="evi_x_mu", choices=["evi_x_mu", "evi_only"])
     ap.add_argument("--gate-lambda", type=float, default=2.0)
     ap.add_argument("--g-min", type=float, default=0.05)
     ap.add_argument("--smooth-g", action="store_true", help="邻接平滑 gate")
@@ -536,7 +593,7 @@ def parse_args():
     ap.add_argument("--gate-rho", type=float, default=0.6, help="目标平均开度 ρ（一般 0.6 左右）")
 
     # Stage A/B
-    ap.add_argument("--stage", default="ab", choices=["a","ab"], help="a: 单阶段；ab: A 后开启门控进入 B")
+    ap.add_argument("--stage", default="ab", choices=["a", "ab"], help="a: 单阶段；ab: A 后开启门控进入 B")
     ap.add_argument("--stage-a-epochs", type=int, default=15, help="阶段A 训练轮数（仅 --stage ab 生效）")
 
     # Top-k sparsity
@@ -544,12 +601,12 @@ def parse_args():
     ap.add_argument("--topk-warmup-epochs", type=int, default=10, help="Top-k 线性 warm-up 轮数（Stage-B）")
 
     # Pooling & attention regularization
-    ap.add_argument("--pooling", default="attn", choices=["mean","attn"])
+    ap.add_argument("--pooling", default="attn", choices=["mean", "attn"])
     ap.add_argument("--attn-temp", type=float, default=1.0, help="注意力温度（>1 更平滑）")
     ap.add_argument("--entropy-reg", type=float, default=0.0, help="注意力熵正则权重")
 
     # Loss
-    ap.add_argument("--loss-type", default="bce", choices=["bce","bce_weighted","focal"])
+    ap.add_argument("--loss-type", default="bce", choices=["bce", "bce_weighted", "focal"])
     ap.add_argument("--focal-gamma", type=float, default=2.0)
     ap.add_argument("--focal-alpha", type=float, default=0.25)
     ap.add_argument("--evi-reg", type=float, default=0.0, help="Evidential 正则权重")
@@ -566,6 +623,19 @@ def parse_args():
 
     return ap.parse_args()
 
+
+def find_start_fold(args) -> int:
+    for f in range(1, args.folds + 1):
+        fold_dir = Path(args.out) / f"fold{f}"
+        last_ckpt = fold_dir / "last.pth"
+        if not last_ckpt.exists():
+            return f
+        e = load_ckpt_epoch(last_ckpt)
+        if e < args.epochs:
+            return f
+    return args.folds + 1  # all done
+
+
 if __name__ == "__main__":
     args = parse_args()
     print(f"[ENV] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}")
@@ -573,14 +643,28 @@ if __name__ == "__main__":
     device = torch.device("cuda" if use_cuda else "cpu")
     print(f"device: {'cuda' if use_cuda else 'cpu'} | cuda_available: {use_cuda}")
     if use_cuda:
-        try: print("gpu:", torch.cuda.get_device_name(0))
-        except Exception: pass
+        try:
+            print("gpu:", torch.cuda.get_device_name(0))
+        except Exception:
+            pass
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(42); np.random.seed(42)
+    torch.manual_seed(42);
+    np.random.seed(42)
 
-    all_best: List[Dict[str,float]] = []
-    for fold in range(1, 5 + 1):
+    # ===== Global auto-resume across folds =====
+    start_fold = args.start_fold
+    if args.auto_resume:
+        sf = find_start_fold(args)
+        if sf <= args.folds:
+            start_fold = sf
+            print(
+                f"[AUTO-RESUME] will continue from fold{start_fold} based on last.pth epochs under target --epochs={args.epochs}")
+        else:
+            print("[AUTO-RESUME] all folds already reached target epochs; nothing to do.")
+
+    all_best: List[Dict[str, float]] = []
+    for fold in range(start_fold, args.folds + 1):
         best = run_one_fold(args, fold, device)
         all_best.append(best)
     summarize(all_best, Path(args.out))
