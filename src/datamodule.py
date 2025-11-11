@@ -13,20 +13,22 @@ from torch.utils.data import Dataset, DataLoader
 # ---------------- configs ----------------
 @dataclass
 class DMConfig:
-    train_csv: str
-    test_csv: str
+    # 仅使用“内存数据”模式：直接传 (smiles, proteins, labels) 列表
+    train_data: Tuple[List[str], List[str], List[float]]
+    val_data:   Tuple[List[str], List[str], List[float]]
+    test_data:  Tuple[List[str], List[str], List[float]]
     batch_size: int = 64
     num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True
     prefetch_factor: int = 2
     drop_last: bool = False
-    # 新增：是否以“序列级（per-token）”模式工作
+    # 是否以“序列级（per-token）”模式工作
     sequence: bool = False
 
 @dataclass
 class CacheDirs:
-    esm2_dir: str
+    esm_dir: str        # 传任意一个（esm 或 esm2），内部会自动在二者间回退
     molclr_dir: str
     chemberta_dir: str
 
@@ -95,6 +97,7 @@ def _to_tensor(x: np.ndarray) -> torch.Tensor:
     return torch.tensor(arr, dtype=torch.float32)
 
 def _read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[float]]:
+    """读取 all.csv（列：smiles,protein,label）"""
     smiles, proteins, labels = [], [], []
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f, delimiter=",", quoting=csv.QUOTE_MINIMAL)
@@ -155,21 +158,22 @@ def _lookup(tbl: Dict[str, Path], keys: List[str]) -> Optional[Path]:
             return p
     return None
 
-# ---------------- dataset ----------------
-class DTIDataset(Dataset):
-    def __init__(self, csv_path: str,
-                 esm2_tbl: Dict[str, Path],
+# ---------------- dataset：仅内存版 ----------------
+class DTIDatasetMem(Dataset):
+    """直接接收切片后的 (smiles, protein, label) 列表"""
+    def __init__(self,
+                 data: Tuple[List[str], List[str], List[float]],
+                 esm_tbl: Dict[str, Path],
                  molclr_tbl: Dict[str, Path],
                  chem_tbl: Dict[str, Path],
                  dims: CacheDims,
                  sequence: bool = False):
-        self.smiles, self.proteins, self.labels = _read_smiles_protein_label(csv_path)
-        self.esm2_tbl = esm2_tbl
+        self.smiles, self.proteins, self.labels = data
+        self.esm_tbl = esm_tbl
         self.molclr_tbl = molclr_tbl
         self.chem_tbl = chem_tbl
         self.dims = dims
         self.sequence = sequence
-        # 进程内缓存
         self._cache_p, self._cache_d1, self._cache_d2 = {}, {}, {}
 
     def __len__(self):
@@ -182,7 +186,7 @@ class DTIDataset(Dataset):
         v = cache.get(k)
         if v is None:
             arr = _as_1d(_npz_load_first_key(Path(k)), d)
-            v = _to_tensor(arr)  # CPU tensor
+            v = _to_tensor(arr)
             cache[k] = v
         return v
 
@@ -192,7 +196,7 @@ class DTIDataset(Dataset):
         k = str(p)
         v = cache.get(k)
         if v is None:
-            arr = _as_2d(_npz_load_first_key(Path(k)))  # (T,D)
+            arr = _as_2d(_npz_load_first_key(Path(k)))
             cache[k] = arr
             v = arr
         return v
@@ -202,20 +206,19 @@ class DTIDataset(Dataset):
         pro = self.proteins[idx]
         y   = float(self.labels[idx])
 
-        p_path  = _lookup(self.esm2_tbl, _prot_variants(pro))
+        p_path  = _lookup(self.esm_tbl,   _prot_variants(pro))
         d1_path = _lookup(self.molclr_tbl, _smiles_variants(smi))
-        d2_path = _lookup(self.chem_tbl,  _smiles_variants(smi))
+        d2_path = _lookup(self.chem_tbl,   _smiles_variants(smi))
 
         if not self.sequence:
-            v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)   # [d_p]
-            v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)  # [d_d1]
-            v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)  # [d_chem]
+            v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)
+            v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)
+            v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)
             return v_p, v_d1, v_d2, torch.tensor(y, dtype=torch.float32)
         else:
-            # V2: per-token
-            P  = self._seq_cached(p_path,  self._cache_p)    # (M, d_p)
-            D1 = self._seq_cached(d1_path, self._cache_d1)   # (N, d_d1)
-            C  = self._seq_cached(d2_path, self._cache_d2)   # 通常是 1D；也允许 (T,dc) 取均值
+            P  = self._seq_cached(p_path,  self._cache_p)
+            D1 = self._seq_cached(d1_path, self._cache_d1)
+            C  = self._seq_cached(d2_path, self._cache_d2)
             if C.ndim == 2:
                 C = C.mean(axis=0)
             return P, D1, C.astype(np.float32, copy=True), np.float32(y)
@@ -239,65 +242,62 @@ def _pad_and_mask(batch_list: List[np.ndarray]) -> Tuple[torch.Tensor, torch.Ten
 class DataModule:
     def __init__(self, cfg: DMConfig, cache_dirs: CacheDirs, dims: CacheDims):
         self.cfg = cfg
-        self.cache_dirs = cache_dirs
         self.dims = dims
 
-        # ------- 兼容 esm / esm2 两种命名 -------
-        esm_candidates = [Path(cache_dirs.esm2_dir)]
-        if "esm" + "/" in cache_dirs.esm2_dir and "/esm2/" not in cache_dirs.esm2_dir:
-            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm/", "/esm2/")))
-        if "/esm2/" in cache_dirs.esm2_dir:
-            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm2/", "/esm/")))
-
-        picked_esm = None
+        # 兼容 esm / esm2 两种命名（自动回退）
+        cand = [Path(cache_dirs.esm_dir)]
+        if "/esm2/" in cache_dirs.esm_dir:
+            cand.append(Path(cache_dirs.esm_dir.replace("/esm2/", "/esm/")))
+        elif "/esm/" in cache_dirs.esm_dir:
+            cand.append(Path(cache_dirs.esm_dir.replace("/esm/", "/esm2/")))
+        picked = None
         esm_tbl = {}
-        for cand in esm_candidates:
-            tbl = _index_npz_dir(cand)
+        for c in cand:
+            tbl = _index_npz_dir(c)
             if len(tbl) > 0:
-                picked_esm, esm_tbl = cand, tbl
+                picked, esm_tbl = c, tbl
                 break
-        if picked_esm is None:
-            picked_esm = esm_candidates[0]
-            esm_tbl = _index_npz_dir(picked_esm)
+        if picked is None:
+            picked = cand[0]
+            esm_tbl = _index_npz_dir(picked)
 
-        self.esm_dir_used = str(picked_esm)
-        self.esm2_tbl = esm_tbl
-        self.molclr_tbl = _index_npz_dir(Path(self.cache_dirs.molclr_dir))
-        self.chem_tbl  = _index_npz_dir(Path(self.cache_dirs.chemberta_dir))
+        self.esm_dir_used = str(picked)
+        self.esm_tbl = esm_tbl
+        self.molclr_tbl = _index_npz_dir(Path(cache_dirs.molclr_dir))
+        self.chem_tbl  = _index_npz_dir(Path(cache_dirs.chemberta_dir))
         print(f"[CACHE] esm_dir_used={self.esm_dir_used}")
-        print(f"[CACHE] molclr_dir  ={self.cache_dirs.molclr_dir}")
-        print(f"[CACHE] chem_dir    ={self.cache_dirs.chemberta_dir}")
+        print(f"[CACHE] molclr_dir  ={cache_dirs.molclr_dir}")
+        print(f"[CACHE] chem_dir    ={cache_dirs.chemberta_dir}")
 
         t0 = time.time()
-        t1 = time.time()
-        print(f"[PRELOAD] Index ESM2={len(self.esm2_tbl)} MolCLR={len(self.molclr_tbl)} ChemBERTa={len(self.chem_tbl)}   took {t1 - t0:.1f}s")
+        print(f"[PRELOAD] Index ESM={len(self.esm_tbl)} MolCLR={len(self.molclr_tbl)} ChemBERTa={len(self.chem_tbl)}   took {time.time()-t0:.1f}s")
 
-        self._report_hit_rates(cfg.train_csv, tag="train")
-        self._report_hit_rates(cfg.test_csv,  tag="test")
+        # 命中率报告
+        self._report_hit_rates_data(self.cfg.train_data, tag="train")
+        self._report_hit_rates_data(self.cfg.val_data,   tag="val")
+        self._report_hit_rates_data(self.cfg.test_data,  tag="test")
 
-    def _report_hit_rates(self, csv_path: str, tag: str):
-        smi, pro, lab = _read_smiles_protein_label(csv_path)
-        n = len(lab)
+    def _report_hit_rates_data(self, data: Tuple[List[str], List[str], List[float]], tag: str):
+        smi, pro, _ = data
+        n = len(smi)
         if n == 0:
-            print(f"[HIT/{tag}] empty CSV: {csv_path}")
+            print(f"[HIT/{tag}] empty data")
             return
         idxs = list(range(n))
         if n > 2000:
             random.seed(42); idxs = random.sample(idxs, 2000)
-
         hit_p = hit_d1 = hit_d2 = hit_all = 0
         for i in idxs:
-            p = _lookup(self.esm2_tbl, _prot_variants(pro[i]))
+            p = _lookup(self.esm_tbl,   _prot_variants(pro[i]))
             d1 = _lookup(self.molclr_tbl, _smiles_variants(smi[i]))
-            d2 = _lookup(self.chem_tbl,  _smiles_variants(smi[i]))
+            d2 = _lookup(self.chem_tbl,   _smiles_variants(smi[i]))
             hp = p is not None
             hd1 = d1 is not None
             hd2 = d2 is not None
             hit_p += hp; hit_d1 += hd1; hit_d2 += hd2; hit_all += (hp and hd1 and hd2)
-
         total = len(idxs)
         def pct(x): return f"{x/total*100:.1f}%"
-        print(f"[HIT/{tag}] sample={total} | ESM2={pct(hit_p)} MolCLR={pct(hit_d1)} ChemBERTa={pct(hit_d2)} | ALL-3={pct(hit_all)}")
+        print(f"[HIT/{tag}] sample={total} | ESM={pct(hit_p)} MolCLR={pct(hit_d1)} ChemBERTa={pct(hit_d2)} | ALL-3={pct(hit_all)}")
 
     # ----------- V1：向量模式 -----------
     def _collate_v1(self, b):
@@ -319,26 +319,21 @@ class DataModule:
         y = torch.tensor(np.asarray(y_list, dtype=np.float32), dtype=torch.float32)
         return P, Pm, D, Dm, C, y
 
-    def train_loader(self) -> DataLoader:
-        ds = DTIDataset(self.cfg.train_csv, self.esm2_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
-        if not self.cfg.sequence:
-            cf = self._collate_v1
-        else:
-            cf = self._collate_v2
+    def _make_loader(self, data, shuffle: bool) -> DataLoader:
+        ds = DTIDatasetMem(data, self.esm_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
+        cf = self._collate_v1 if not self.cfg.sequence else self._collate_v2
         return DataLoader(
-            ds, batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers,
+            ds, batch_size=self.cfg.batch_size, shuffle=shuffle, num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
-            prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last, collate_fn=cf
+            prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last if shuffle else False,
+            collate_fn=cf
         )
 
+    def train_loader(self) -> DataLoader:
+        return self._make_loader(self.cfg.train_data, shuffle=True)
+
+    def val_loader(self) -> DataLoader:
+        return self._make_loader(self.cfg.val_data, shuffle=False)
+
     def test_loader(self) -> DataLoader:
-        ds = DTIDataset(self.cfg.test_csv, self.esm2_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
-        if not self.cfg.sequence:
-            cf = self._collate_v1
-        else:
-            cf = self._collate_v2
-        return DataLoader(
-            ds, batch_size=self.cfg.batch_size, shuffle=False, num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
-            prefetch_factor=self.cfg.prefetch_factor, drop_last=False, collate_fn=cf
-        )
+        return self._make_loader(self.cfg.test_data, shuffle=False)
