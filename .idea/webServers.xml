@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="f47bc9d8-0c03-4818-bb3d-154513f7adcc" name="3090">
+        <fileTransfer rootFolder="/root" accessType="SFTP" host="link.lanyun.net" port="37891" sshConfigId="5e864481-f7c8-4771-888a-eb14b349368f" sshConfig="3090">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" isUseRsync="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

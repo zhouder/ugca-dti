@@ -44,6 +44,7 @@ def fmt1(m: Dict[str, float]) -> str:
             f"F1 {m['f1']:>7.4f} | ACC {m['acc']:>7.4f} | "
             f"SEN {m['sen']:>7.4f} | MCC {m['mcc']:>7.4f}")
 
+<<<<<<< HEAD
 def find_best_threshold(prob: np.ndarray, y_true: np.ndarray, grid: np.ndarray | None = None) -> float:
     """在验证集上搜索使 F1 最大的阈值"""
     if grid is None:
@@ -61,6 +62,9 @@ def find_best_threshold(prob: np.ndarray, y_true: np.ndarray, grid: np.ndarray |
     return float(best_t)
 
 # ---------- model loader ----------
+=======
+# ===== 模型装载（优先 build_model(cfg)） =====
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
 def build_model_from_src(dims: CacheDims, prefer_class: str | None = None, sequence: bool = False) -> nn.Module:
     model_mod = importlib.import_module("src.model")
     if hasattr(model_mod, "build_model"):
@@ -71,6 +75,10 @@ def build_model_from_src(dims: CacheDims, prefer_class: str | None = None, seque
             "d_chem":    int(dims.chemberta),
             "d_model":   512, "dropout": 0.1, "act": "silu",
             "mutan_rank": 10, "mutan_dim": 512, "head_hidden": 512,
+<<<<<<< HEAD
+=======
+            # V2 相关
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
             "sequence": bool(sequence),
             "nhead": 4, "nlayers": 2
         }
@@ -90,6 +98,7 @@ def build_model_from_src(dims: CacheDims, prefer_class: str | None = None, seque
                 except Exception: return c({"d_protein": dims.esm2, "d_molclr": dims.molclr, "d_chem": dims.chemberta})
     raise RuntimeError("在 src/model.py 中没找到可用的模型类。")
 
+<<<<<<< HEAD
 # ---------- train / eval ----------
 def _batch_to_device(batch, device: torch.device):
     if isinstance(batch, (list, tuple)):
@@ -110,6 +119,41 @@ def _forward_any(model: nn.Module, batch):
 
 def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimizer: optim.Optimizer,
                 tag: str, ep: int, ep_total: int, gate_budget: float = 0.0, gate_rho: float = 0.6) -> Tuple[float, float]:
+=======
+# ===== 训练/测试 =====
+def _batch_to_device(batch, device):
+    if len(batch) == 4:
+        v1, v2, v3, y = batch
+        return (v1.to(device, non_blocking=True),
+                v2.to(device, non_blocking=True),
+                v3.to(device, non_blocking=True),
+                y.to(device))
+    elif len(batch) == 6:
+        P, Pm, D, Dm, C, y = batch
+        return (P.to(device, non_blocking=True),
+                Pm.to(device, non_blocking=True),
+                D.to(device, non_blocking=True),
+                Dm.to(device, non_blocking=True),
+                C.to(device, non_blocking=True),
+                y.to(device))
+    else:
+        raise RuntimeError(f"Unknown batch format len={len(batch)}")
+
+def _forward_any(model: nn.Module, batch_tensors):
+    if len(batch_tensors) == 4:
+        v1, v2, v3, y = batch_tensors
+        logits = model(v1, v2, v3)
+        return logits, y
+    else:
+        P, Pm, D, Dm, C, y = batch_tensors
+        # UGCASeqModel.forward(P, Pm, D, Dm, C)
+        logits = model(P, Pm, D, Dm, C)
+        return logits, y
+
+def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
+                optimizer: optim.Optimizer, tag: str, ep: int, ep_total: int,
+                gate_budget: float = 0.0, gate_rho: float = 0.6) -> Tuple[float, float]:
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     model.train(True)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
@@ -124,9 +168,17 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, opti
         logits, y = _forward_any(model, batch)
         loss = bce(logits, y)
 
+<<<<<<< HEAD
         if gate_budget > 0.0 and hasattr(model, "last_gates"):
             gd, gp = model.last_gates()
             if gd is not None and gp is not None:
+=======
+        # ===== 门控预算正则（可选，V2 有效；V1 返回 None） =====
+        if gate_budget > 0.0 and hasattr(model, "last_gates"):
+            gd, gp = model.last_gates()
+            if gd is not None and gp is not None:
+                # 对每个样本计算 token 级均值，再对 batch 求均值
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
                 def _mean1d(g): return g.mean(dim=1).mean()
                 Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
                 loss = loss + gate_budget * Lb
@@ -146,7 +198,11 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, opti
     pbar.close()
     return tot / max(1, n_seen / bs), time.time() - t0
 
+<<<<<<< HEAD
 def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, np.ndarray, np.ndarray, float]:
+=======
+def test_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, np.ndarray, np.ndarray, float]:
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     model.train(False)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
@@ -166,14 +222,150 @@ def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tu
     lab  = np.concatenate(labels, axis=0) if labels else np.zeros((0,), dtype=np.float32)
     return tot / max(1, len(loader)), prob, lab, time.time() - t0
 
+<<<<<<< HEAD
 # ---------- CLI ----------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="如 DAVIS / BindingDB / BioSNAP（大小写不敏感）")
+=======
+def save_ckpt(path: Path, model: nn.Module, epoch: int, metrics: Dict[str,float], opt_state: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"epoch": epoch, "state_dict": model.state_dict(),
+                "metrics": metrics, "optimizer": opt_state}, str(path))
+
+# ===== 单折 =====
+def run_one_fold(args, fold: int, device: torch.device) -> Dict[str, float]:
+    ds_lower = args.dataset.lower()
+    ds_cap   = {"bindingdb":"BindingDB", "davis":"DAVIS", "biosnap":"BioSNAP"}.get(ds_lower, args.dataset)
+    data_root = Path(args.data_root)
+
+    csv_dir   = data_root / args.dataset_dirname
+    train_csv = str(csv_dir / f"fold{fold}_train.csv")
+    test_csv  = str(csv_dir / f"fold{fold}_test.csv")
+
+    print(f"=== dataset: {ds_lower} fold: {fold} ===")
+    print("[paths] train =", train_csv)
+    print("[paths] test  =", test_csv)
+
+    cache_root = data_root / "cache"
+    cache_dirs = CacheDirs(
+        # 传 esm，DataModule 内部会在 esm/esm2 之间自动回退
+        esm2_dir      = str(cache_root / "esm"       / ds_cap),
+        molclr_dir    = str(cache_root / "molclr"    / ds_cap),
+        chemberta_dir = str(cache_root / "chemberta" / ds_cap),
+    )
+    dims = CacheDims(esm2=1280, molclr=300, chemberta=384)
+
+    dm = DataModule(
+        DMConfig(
+            train_csv=train_csv, test_csv=test_csv,
+            num_workers=args.workers, batch_size=args.batch_size,
+            pin_memory=True, persistent_workers=args.workers>0,
+            prefetch_factor=2, drop_last=False,
+            sequence=args.sequence
+        ),
+        cache_dirs=cache_dirs, dims=dims
+    )
+
+    train_loader = dm.train_loader()
+    test_loader  = dm.test_loader()
+    N = len(train_loader.dataset)
+    print(f"[INFO] train size = {N} | batch_size = {args.batch_size} | sequence={args.sequence}")
+
+    model = build_model_from_src(dims, args.model_class, sequence=args.sequence).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    fold_dir = Path(args.out) / f"fold{fold}"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = fold_dir / "metrics.csv"
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch","train_loss","test_loss","AUROC","AUPRC","F1","ACC","SEN","MCC","time_train_s","time_test_s"])
+
+    def score_for_best(m: Dict[str,float]) -> float:
+        return m["auroc"] if not math.isnan(m["auroc"]) else m["acc"]
+
+    best_score = -1.0
+    best_row: Dict[str,float] = {}
+    best_epoch = -1
+
+    for ep in range(1, args.epochs + 1):
+        tr_loss, tr_t = train_epoch(model, train_loader, device, optimizer,
+                                    tag=f"{ds_lower}/train", ep=ep, ep_total=args.epochs,
+                                    gate_budget=args.gate_budget, gate_rho=args.gate_rho)
+        te_loss, prob, y, te_t = test_epoch(model, test_loader, device)
+        m = compute_metrics(prob, y)
+
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([ep, f"{tr_loss:.6f}", f"{te_loss:.6f}",
+                        f"{m['auroc']:.6f}", f"{m['auprc']:.6f}", f"{m['f1']:.6f}",
+                        f"{m['acc']:.6f}", f"{m['sen']:.6f}", f"{m['mcc']:.6f}",
+                        f"{tr_t:.1f}", f"{te_t:.1f}"])
+
+        print(f"[{ds_lower}] fold{fold} ep{ep:03d} | train_loss {tr_loss:.4f} | test_loss {te_loss:.4f} | {fmt1(m)} | time {tr_t:.1f}s/{te_t:.1f}s")
+
+        save_ckpt(fold_dir / "last.pth", model, ep, m, optimizer.state_dict())
+
+        sc = score_for_best(m)
+        if sc > best_score:
+            best_score = sc
+            best_row = dict(m)
+            best_epoch = ep
+            save_ckpt(fold_dir / "best.pth", model, ep, m, optimizer.state_dict())
+
+    # 在 metrics.csv 末尾追加 best 行
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([f"best@{best_epoch}", "", "",
+                    f"{best_row.get('auroc', float('nan')):.6f}",
+                    f"{best_row.get('auprc', float('nan')):.6f}",
+                    f"{best_row.get('f1', float('nan')):.6f}",
+                    f"{best_row.get('acc', float('nan')):.6f}",
+                    f"{best_row.get('sen', float('nan')):.6f}",
+                    f"{best_row.get('mcc', float('nan')):.6f}",
+                    "", ""])
+
+    print(f"[{ds_lower}] fold{fold} best | {fmt1(best_row)} (epoch={best_epoch})")
+    return best_row
+
+def summarize(rows: List[Dict[str,float]], out_dir: Path):
+    keys = ["auroc","auprc","f1","acc","sen","mcc"]
+    # 写每折 best
+    fold_best_csv = out_dir / "fold_best.csv"
+    with open(fold_best_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["fold"] + [k.upper() for k in keys])
+        for i, r in enumerate(rows, 1):
+            w.writerow([i] + [f"{r.get(k, float('nan')):.6f}" for k in keys])
+
+    # 计算 mean/std 并写 summary
+    mean = {k: float(np.nanmean([r.get(k, np.nan) for r in rows])) for k in keys}
+    std  = {k: float(np.nanstd ([r.get(k, np.nan) for r in rows])) for k in keys}
+    summary_csv = out_dir / "summary.csv"
+    with open(summary_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric","mean","std"])
+        for k in keys:
+            w.writerow([k.UPPER(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
+
+    s = " | ".join([f"{k.upper()} {mean[k]:>7.4f}±{std[k]:<7.4f}" for k in keys])
+    print(f"[SUMMARY over 5 folds] {s}")
+    return mean, std
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", required=True, help="bindingdb / davis / biosnap（不区分大小写）")
+    ap.add_argument("--dataset-dirname", required=True, help="如 bindingdb / davis / biosnap")
+    ap.add_argument("--data-root", required=True, help="如 /root/lanyun-tmp")
+    ap.add_argument("--out", required=True, help="如 /root/lanyun-tmp/ugca-runs/bindingdb")
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--lr", type=float, default=2e-4)
+<<<<<<< HEAD
     ap.add_argument("--model-class", default="", help="通常不用；除非你显式选类（如 UGCASeqModel）")
     ap.add_argument("--seed", type=int, default=42)
 
@@ -189,6 +381,14 @@ def parse_args():
     ap.add_argument("--overall-val",   type=float, default=0.1)
     ap.add_argument("--thr", default="auto",
                     help="决策阈值；'auto'=在验证集上选择使F1最大的阈值；或显式给出如 0.35")
+=======
+    ap.add_argument("--resume", default="")
+    ap.add_argument("--model-class", default="", help="通常不用；除非你显式选类（如 UGCASeqModel）")
+    # 新增：V2 序列级与门控预算
+    ap.add_argument("--sequence", action="store_true", help="启用 per-token（序列级）模式")
+    ap.add_argument("--gate-budget", type=float, default=0.0, help="门控预算正则系数 λb（0 关闭）")
+    ap.add_argument("--gate-rho", type=float, default=0.6, help="目标平均开度 ρ（一般 0.6 左右）")
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     return ap.parse_args()
 
 # ---------- helpers for split ----------
@@ -225,6 +425,7 @@ if __name__ == "__main__":
     if not all_csv.exists():
         raise FileNotFoundError(f"未找到 {all_csv}，请确认你已把 all.csv 放到该路径。")
 
+<<<<<<< HEAD
     cache_root = data_root / "cache"
     cache_dirs = CacheDirs(
         esm_dir      = str(cache_root / "esm2"     / ds_cap),   # 自动在 esm2/esm 间回退
@@ -358,3 +559,10 @@ if __name__ == "__main__":
         w = csv.writer(f); w.writerow(["metric","mean","std"])
         for k in keys: w.writerow([k.upper(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
     print("[CV] " + " | ".join([f"{k.upper()} {mean[k]:.4f}±{std[k]:.4f}" for k in keys]))
+=======
+    all_best: List[Dict[str,float]] = []
+    for fold in range(1, 5 + 1):
+        best = run_one_fold(args, fold, device)
+        all_best.append(best)
+    summarize(all_best, Path(args.out))
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752

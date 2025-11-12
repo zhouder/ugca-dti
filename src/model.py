@@ -9,9 +9,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+<<<<<<< HEAD
 # =========================
 # Utils
 # =========================
+=======
+# ====== 小工具 ======
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
 def _act(name: str) -> nn.Module:
     name = (name or "relu").lower()
     return {
@@ -31,9 +35,13 @@ class LayerNorm1d(nn.Module):
             return self.ln(x.float()).type_as(x)
         return self.ln(x)
 
+<<<<<<< HEAD
 # =========================
 # MUTAN (low-rank bilinear)
 # =========================
+=======
+# ====== MUTAN（低秩双线性池化）======
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
 class Mutan(nn.Module):
     def __init__(self, dx: int, dy: int, dz: int, rank: int = 10, dropout: float = 0.1, act: str = "tanh"):
         super().__init__()
@@ -52,11 +60,16 @@ class Mutan(nn.Module):
         z = z.sum(dim=1)                        # [B,dz]
         return self.out(z)
 
+<<<<<<< HEAD
 # =========================
 # UGCA (V1: vector-level)
 # =========================
 class UGCAUnit(nn.Module):
     """Gated fusion of two global vectors -> d-model"""
+=======
+# ====== UGCA（V1：向量级门控融合）======
+class UGCAUnit(nn.Module):
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     def __init__(self, da: int, db: int, d: int, dropout: float = 0.1, act: str = "silu"):
         super().__init__()
         self.pa = nn.Linear(da, d, bias=False)
@@ -74,6 +87,10 @@ class UGCAUnit(nn.Module):
         out = g * A2 + (1.0 - g) * B2
         return out
 
+<<<<<<< HEAD
+=======
+# ====== V1 顶层模型 ======
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
 @dataclass
 class ModelCfg:
     d_protein: int = 1280   # ESM2
@@ -87,7 +104,17 @@ class ModelCfg:
     head_hidden: int = 512
 
 class UGCAModel(nn.Module):
+<<<<<<< HEAD
     """V1 (vector-level)"""
+=======
+    """
+    V1（向量级）：molclr + chemberta -> UGCA -> 与 protein 做 MUTAN -> 分类
+    输入：
+        v_protein:  [B, d_protein]
+        v_molclr:   [B, d_molclr]
+        v_chem:     [B, d_chem]
+    """
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     def __init__(self, cfg: ModelCfg):
         super().__init__()
         self.cfg = cfg = ModelCfg(**cfg) if isinstance(cfg, dict) else cfg
@@ -104,6 +131,10 @@ class UGCAModel(nn.Module):
             nn.Linear(cfg.head_hidden, 1),
         )
         self.apply(self._init_weights)
+<<<<<<< HEAD
+=======
+        # 为了与训练里门控预算接口兼容（V1 没有 token 级门控，这里返回 None）
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self._last_gd = None
         self._last_gp = None
 
@@ -119,12 +150,17 @@ class UGCAModel(nn.Module):
         prot = self.proj_prot(v_protein)                      # [B, d]
         joint = self.mutan_dp(drug, prot)                     # [B, mutan_dim]
         logit = self.head(joint).squeeze(-1)                  # [B]
+<<<<<<< HEAD
+=======
+        # V1：没有 token 级门控，清空
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self._last_gd, self._last_gp = None, None
         return logit
 
     def last_gates(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self._last_gd, self._last_gp
 
+<<<<<<< HEAD
 # =========================
 # V2: sequence-level UGCA
 # =========================
@@ -192,18 +228,41 @@ class GatedCrossAttn(nn.Module):
                  gate_type: str = "evidential", gate_lambda: float = 2.0,
                  gate_mode: str = "evi_x_mu", g_min: float = 0.05,
                  smooth_g: bool = False, attn_temp: float = 1.0):
+=======
+# ====== V2：序列级 UGCA（per-token）======
+class TokenGate(nn.Module):
+    """给每个 token 产生一个门控 g∈(0,1)"""
+    def __init__(self, d: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.mlp(x))  # (B,T,1)
+
+class GatedCrossAttn(nn.Module):
+    """
+    x<->y 的对称门控 cross-attn：
+      score_xy = Qx Ky^T / sqrt(dh) + log(gx) + log(gy)^T
+      attn_xy  = softmax(score_xy)
+      out_x    = attn_xy Vy
+    """
+    def __init__(self, d: int, nhead: int = 4, dropout: float = 0.1):
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         super().__init__()
         assert d % nhead == 0
         self.d, self.h = d, nhead
         self.dk = d // nhead
+<<<<<<< HEAD
         self.attn_temp = float(attn_temp)
         # QKV
+=======
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self.qx = nn.Linear(d, d, bias=False)
         self.kx = nn.Linear(d, d, bias=False)
         self.vx = nn.Linear(d, d, bias=False)
         self.qy = nn.Linear(d, d, bias=False)
         self.ky = nn.Linear(d, d, bias=False)
         self.vy = nn.Linear(d, d, bias=False)
+<<<<<<< HEAD
         # Gate
         gt = (gate_type or "evidential").lower()
         if gt.startswith("evi"):
@@ -214,6 +273,10 @@ class GatedCrossAttn(nn.Module):
             self.gy = TokenGate(d, g_min=g_min)
         self.smooth_g = bool(smooth_g)
         # Output
+=======
+        self.gx = TokenGate(d)
+        self.gy = TokenGate(d)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self.out_x = nn.Linear(d, d, bias=False)
         self.out_y = nn.Linear(d, d, bias=False)
         self.dropout = nn.Dropout(dropout)
@@ -221,6 +284,7 @@ class GatedCrossAttn(nn.Module):
         self.ln_y = nn.LayerNorm(d)
         self.ff_x = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Dropout(dropout))
         self.ff_y = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Dropout(dropout))
+<<<<<<< HEAD
         # Buffers to expose attention entropy (for optional regularization)
         self.last_entropy_x = None
         self.last_entropy_y = None
@@ -230,10 +294,21 @@ class GatedCrossAttn(nn.Module):
         return t.view(B, T, self.h, self.dk).transpose(1, 2)  # (B,h,T,dk)
 
     def _merge(self, t: torch.Tensor) -> torch.Tensor:
+=======
+
+    def _split(self, t: torch.Tensor) -> torch.Tensor:
+        # (B,T,d) -> (B,h,T,dk)
+        B, T, _ = t.shape
+        return t.view(B, T, self.h, self.dk).transpose(1, 2)
+
+    def _merge(self, t: torch.Tensor) -> torch.Tensor:
+        # (B,h,T,dk) -> (B,T,d)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         B, _, T, _ = t.shape
         return t.transpose(1, 2).contiguous().view(B, T, self.d)
 
     def forward(self, x: torch.Tensor, x_mask: torch.Tensor,
+<<<<<<< HEAD
                       y: torch.Tensor, y_mask: torch.Tensor,
                       gate_enabled: bool = True):
         B, Nx, d = x.shape
@@ -256,27 +331,55 @@ class GatedCrossAttn(nn.Module):
         scores_xy = torch.matmul(qx, ky.transpose(-2, -1)) / (math.sqrt(self.dk) * max(self.attn_temp, 1e-6))
         if gate_enabled:
             scores_xy = scores_xy + log_gx.unsqueeze(1) + log_gy.transpose(1,2).unsqueeze(1)
+=======
+                      y: torch.Tensor, y_mask: torch.Tensor):
+        B, Nx, d = x.shape
+        Ny = y.shape[1]
+        qx, kx, vx = self._split(self.qx(x)), self._split(self.kx(x)), self._split(self.vx(x))  # (B,h,Nx,dk)
+        qy, ky, vy = self._split(self.qy(y)), self._split(self.ky(y)), self._split(self.vy(y))  # (B,h,Ny,dk)
+
+        gx = self.gx(x).clamp_min(1e-6)  # (B,Nx,1)
+        gy = self.gy(y).clamp_min(1e-6)  # (B,Ny,1)
+
+        # x -> y
+        scores_xy = torch.matmul(qx, ky.transpose(-2, -1)) / math.sqrt(self.dk)  # (B,h,Nx,Ny)
+        scores_xy = scores_xy + torch.log(gx).unsqueeze(1) + torch.log(gy.transpose(1, 2)).unsqueeze(1)  # broadcast
+        # mask y 端
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         if y_mask is not None:
             mask_y = (~y_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,Ny)
             scores_xy = scores_xy.masked_fill(mask_y, float("-inf"))
         attn_xy = torch.softmax(scores_xy, dim=-1)
+<<<<<<< HEAD
         self.last_entropy_x = (-attn_xy * (torch.log(attn_xy + 1e-8))).sum(dim=-1).mean()  # mean over (B,h,Nx)
         attn_xy = self.dropout(attn_xy)
         out_x = torch.matmul(attn_xy, vy)
+=======
+        attn_xy = self.dropout(attn_xy)
+        out_x = torch.matmul(attn_xy, vy)  # (B,h,Nx,dk)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         out_x = self._merge(out_x)
         out_x = self.out_x(out_x)
         x2 = self.ln_x(x + out_x)
         x2 = self.ln_x(x2 + self.ff_x(x2))
 
         # y -> x
+<<<<<<< HEAD
         scores_yx = torch.matmul(qy, kx.transpose(-2, -1)) / (math.sqrt(self.dk) * max(self.attn_temp, 1e-6))
         if gate_enabled:
             scores_yx = scores_yx + log_gy.unsqueeze(1) + log_gx.transpose(1, 2).unsqueeze(1)
+=======
+        scores_yx = torch.matmul(qy, kx.transpose(-2, -1)) / math.sqrt(self.dk)  # (B,h,Ny,Nx)
+        scores_yx = scores_yx + torch.log(gy).unsqueeze(1) + torch.log(gx.transpose(1, 2)).unsqueeze(1)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         if x_mask is not None:
             mask_x = (~x_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,Nx)
             scores_yx = scores_yx.masked_fill(mask_x, float("-inf"))
         attn_yx = torch.softmax(scores_yx, dim=-1)
+<<<<<<< HEAD
         self.last_entropy_y = (-attn_yx * (torch.log(attn_yx + 1e-8))).sum(dim=-1).mean()
+=======
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         attn_yx = self.dropout(attn_yx)
         out_y = torch.matmul(attn_yx, vx)
         out_y = self._merge(out_y)
@@ -284,6 +387,7 @@ class GatedCrossAttn(nn.Module):
         y2 = self.ln_y(y + out_y)
         y2 = self.ln_y(y2 + self.ff_y(y2))
 
+<<<<<<< HEAD
         # Return also gates for budget reg; if disabled, return ones to signal "inactive"
         if gate_enabled:
             gd = gx.squeeze(-1); gp = gy.squeeze(-1)
@@ -292,11 +396,18 @@ class GatedCrossAttn(nn.Module):
         return x2, y2, gd, gp
 
 def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+=======
+        return x2, y2, gx.squeeze(-1), gy.squeeze(-1)  # (B,Nx), (B,Ny)
+
+def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    # x:(B,T,d) m:(B,T) -> (B,d)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     m = m.float()
     s = (x * m.unsqueeze(-1)).sum(dim=1)
     d = m.sum(dim=1, keepdim=True).clamp_min(1.0)
     return s / d
 
+<<<<<<< HEAD
 class AttnPool(nn.Module):
     """Cross attention pooling: use query from the other side's global vector."""
     def __init__(self, d: int, dropout: float = 0.1):
@@ -318,6 +429,8 @@ class AttnPool(nn.Module):
         out = torch.matmul(attn, v).squeeze(1) # (B,d)
         return out
 
+=======
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
 @dataclass
 class SeqCfg:
     d_protein: int = 1280
@@ -330,6 +443,7 @@ class SeqCfg:
     mutan_dim: int = 512
     mutan_rank: int = 10
     head_hidden: int = 512
+<<<<<<< HEAD
     # Gate
     gate_type: str = "evidential"   # evidential | mlp
     gate_mode: str = "evi_x_mu"     # evi_x_mu | evi_only
@@ -351,11 +465,22 @@ class UGCASeqModel(nn.Module):
       - L layers of gated bidirectional cross-attn
       - Pool to global vectors (mean or cross-attn pooling)
       - MUTAN fusion -> classifier
+=======
+
+class UGCASeqModel(nn.Module):
+    """
+    V2（序列级）：
+      Protein tokens (ESM2)  <->  Drug tokens (MolCLR+ChemBERTa)  通过门控 cross-attn
+      然后池化 -> MUTAN -> 分类
+    forward 输入：
+      v_protein:(B,M,dp), mask_p:(B,M), v_mol:(B,N,dd), mask_d:(B,N), v_chem:(B,dc)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     """
     def __init__(self, cfg: SeqCfg):
         super().__init__()
         self.cfg = cfg = SeqCfg(**cfg) if isinstance(cfg, dict) else cfg
         d = cfg.d_model
+<<<<<<< HEAD
         # Projections
         self.proj_p = nn.Linear(cfg.d_protein, d, bias=False)
         self.proj_d = nn.Linear(cfg.d_molclr,  d, bias=False)
@@ -377,6 +502,15 @@ class UGCASeqModel(nn.Module):
             self.pool_d = AttnPool(d, dropout=cfg.dropout)
             self.pool_p = AttnPool(d, dropout=cfg.dropout)
         # MUTAN + head
+=======
+        # 投影
+        self.proj_p = nn.Linear(cfg.d_protein, d, bias=False)
+        self.proj_d = nn.Linear(cfg.d_molclr,  d, bias=False)
+        self.proj_c = nn.Linear(cfg.d_chem,    d, bias=False)
+        # 门控 cross-attn 层堆叠
+        self.layers = nn.ModuleList([GatedCrossAttn(d=d, nhead=cfg.nhead, dropout=cfg.dropout) for _ in range(cfg.nlayers)])
+        # MUTAN + 头
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self.mutan = Mutan(dx=d, dy=d, dz=cfg.mutan_dim, rank=cfg.mutan_rank, dropout=cfg.dropout, act="tanh")
         self.head = nn.Sequential(
             LayerNorm1d(cfg.mutan_dim),
@@ -384,10 +518,16 @@ class UGCASeqModel(nn.Module):
             nn.SiLU(), nn.Dropout(cfg.dropout),
             nn.Linear(cfg.head_hidden, 1)
         )
+<<<<<<< HEAD
         # For training loop: expose latest gates and attn entropies
         self._last_gd = None
         self._last_gp = None
         self._last_entropy = 0.0
+=======
+        # 保存门控以便预算正则
+        self._last_gd = None
+        self._last_gp = None
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
 
         self.apply(self._init)
 
@@ -397,6 +537,7 @@ class UGCASeqModel(nn.Module):
             nn.init.xavier_uniform_(m.weight);
             if m.bias is not None: nn.init.zeros_(m.bias)
 
+<<<<<<< HEAD
     def set_gate_enabled(self, enabled: bool = True):
         self.gate_enabled = bool(enabled)
 
@@ -464,6 +605,24 @@ class UGCASeqModel(nn.Module):
             hp = _masked_mean(P, mP)
 
         # 4) MUTAN + head
+=======
+    def forward(self, v_prot: torch.Tensor, m_prot: torch.Tensor,
+                      v_mol: torch.Tensor,  m_mol: torch.Tensor,
+                      v_chem: torch.Tensor) -> torch.Tensor:
+        # 1) 投影到同维，并用 ChemBERTa 提升药物 token
+        P = self.proj_p(v_prot)                                   # (B,M,d)
+        D = self.proj_d(v_mol) + self.proj_c(v_chem).unsqueeze(1) # (B,N,d) + broadcast
+
+        # 2) 多层门控 cross-attn
+        gd = gp = None
+        for layer in self.layers:
+            D, P, gd, gp = layer(D, m_mol, P, m_prot)             # D<->P
+        self._last_gd, self._last_gp = gd, gp                     # (B,N), (B,M)
+
+        # 3) 池化 + MUTAN + 分类
+        hd = _masked_mean(D, m_mol)                               # (B,d)
+        hp = _masked_mean(P, m_prot)                              # (B,d)
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         z  = self.mutan(hd, hp)                                   # (B,mutan_dim)
         logit = self.head(z).squeeze(-1)                          # (B,)
         return logit
@@ -471,6 +630,7 @@ class UGCASeqModel(nn.Module):
     def last_gates(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self._last_gd, self._last_gp
 
+<<<<<<< HEAD
 # =========================
 # Factory
 # =========================
@@ -478,6 +638,14 @@ def build_model(cfg: Dict) -> nn.Module:
     """
     train.py expects to import build_model(cfg).
     """
+=======
+# ====== 工厂函数（训练脚本优先调用）======
+def build_model(cfg: Dict) -> nn.Module:
+    """
+    train.py 会先尝试 from src.model import build_model
+    """
+    # 兼容：若传了 sequence=True，我就建 UGCASeqModel；否则建 V1
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     if bool(cfg.get("sequence", False)):
         mcfg = SeqCfg(
             d_protein=int(cfg.get("d_protein", 1280)),
@@ -487,6 +655,7 @@ def build_model(cfg: Dict) -> nn.Module:
             nhead=int(cfg.get("nhead", 4)),
             nlayers=int(cfg.get("nlayers", 2)),
             dropout=float(cfg.get("dropout", 0.1)),
+<<<<<<< HEAD
             mutan_rank=int(cfg.get("mutan_rank", 20 if cfg.get("mutan_rank") is None else cfg.get("mutan_rank"))),
             mutan_dim=int(cfg.get("mutan_dim", 256 if cfg.get("mutan_dim") is None else cfg.get("mutan_dim"))),
             head_hidden=int(cfg.get("head_hidden", 512)),
@@ -503,6 +672,11 @@ def build_model(cfg: Dict) -> nn.Module:
             pool_type=str(cfg.get("pool_type", "attn")),
             # regularization
             entropy_reg=float(cfg.get("entropy_reg", 0.0))
+=======
+            mutan_rank=int(cfg.get("mutan_rank", 10)),
+            mutan_dim=int(cfg.get("mutan_dim", 512)),
+            head_hidden=int(cfg.get("head_hidden", 512)),
+>>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         )
         return UGCASeqModel(mcfg)
     else:
