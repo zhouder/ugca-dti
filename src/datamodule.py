@@ -23,11 +23,7 @@ class DMConfig:
     persistent_workers: bool = True
     prefetch_factor: int = 2
     drop_last: bool = False
-<<<<<<< HEAD
     # 是否以“序列级（per-token）”模式工作
-=======
-    # 新增：是否以“序列级（per-token）”模式工作
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
     sequence: bool = False
 
 @dataclass
@@ -172,21 +168,12 @@ class DTIDatasetMem(Dataset):
                  chem_tbl: Dict[str, Path],
                  dims: CacheDims,
                  sequence: bool = False):
-<<<<<<< HEAD
         self.smiles, self.proteins, self.labels = data
         self.esm_tbl = esm_tbl
-=======
-        self.smiles, self.proteins, self.labels = _read_smiles_protein_label(csv_path)
-        self.esm2_tbl = esm2_tbl
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self.molclr_tbl = molclr_tbl
         self.chem_tbl = chem_tbl
         self.dims = dims
         self.sequence = sequence
-<<<<<<< HEAD
-=======
-        # 进程内缓存
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         self._cache_p, self._cache_d1, self._cache_d2 = {}, {}, {}
 
     def __len__(self):
@@ -209,11 +196,7 @@ class DTIDatasetMem(Dataset):
         k = str(p)
         v = cache.get(k)
         if v is None:
-<<<<<<< HEAD
             arr = _as_2d(_npz_load_first_key(Path(k)))
-=======
-            arr = _as_2d(_npz_load_first_key(Path(k)))  # (T,D)
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
             cache[k] = arr
             v = arr
         return v
@@ -228,7 +211,6 @@ class DTIDatasetMem(Dataset):
         d2_path = _lookup(self.chem_tbl,   _smiles_variants(smi))
 
         if not self.sequence:
-<<<<<<< HEAD
             v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)
             v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)
             v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)
@@ -237,17 +219,6 @@ class DTIDatasetMem(Dataset):
             P  = self._seq_cached(p_path,  self._cache_p)
             D1 = self._seq_cached(d1_path, self._cache_d1)
             C  = self._seq_cached(d2_path, self._cache_d2)
-=======
-            v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)   # [d_p]
-            v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)  # [d_d1]
-            v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)  # [d_chem]
-            return v_p, v_d1, v_d2, torch.tensor(y, dtype=torch.float32)
-        else:
-            # V2: per-token
-            P  = self._seq_cached(p_path,  self._cache_p)    # (M, d_p)
-            D1 = self._seq_cached(d1_path, self._cache_d1)   # (N, d_d1)
-            C  = self._seq_cached(d2_path, self._cache_d2)   # 通常是 1D；也允许 (T,dc) 取均值
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
             if C.ndim == 2:
                 C = C.mean(axis=0)
             return P, D1, C.astype(np.float32, copy=True), np.float32(y)
@@ -273,7 +244,6 @@ class DataModule:
         self.cfg = cfg
         self.dims = dims
 
-<<<<<<< HEAD
         # 兼容 esm / esm2 两种命名（自动回退）
         cand = [Path(cache_dirs.esm_dir)]
         if "/esm2/" in cache_dirs.esm_dir:
@@ -281,16 +251,6 @@ class DataModule:
         elif "/esm/" in cache_dirs.esm_dir:
             cand.append(Path(cache_dirs.esm_dir.replace("/esm/", "/esm2/")))
         picked = None
-=======
-        # ------- 兼容 esm / esm2 两种命名 -------
-        esm_candidates = [Path(cache_dirs.esm2_dir)]
-        if "esm" + "/" in cache_dirs.esm2_dir and "/esm2/" not in cache_dirs.esm2_dir:
-            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm/", "/esm2/")))
-        if "/esm2/" in cache_dirs.esm2_dir:
-            esm_candidates.append(Path(cache_dirs.esm2_dir.replace("/esm2/", "/esm/")))
-
-        picked_esm = None
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         esm_tbl = {}
         for c in cand:
             tbl = _index_npz_dir(c)
@@ -359,27 +319,14 @@ class DataModule:
         y = torch.tensor(np.asarray(y_list, dtype=np.float32), dtype=torch.float32)
         return P, Pm, D, Dm, C, y
 
-<<<<<<< HEAD
     def _make_loader(self, data, shuffle: bool) -> DataLoader:
         ds = DTIDatasetMem(data, self.esm_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
         cf = self._collate_v1 if not self.cfg.sequence else self._collate_v2
-=======
-    def train_loader(self) -> DataLoader:
-        ds = DTIDataset(self.cfg.train_csv, self.esm2_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
-        if not self.cfg.sequence:
-            cf = self._collate_v1
-        else:
-            cf = self._collate_v2
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         return DataLoader(
             ds, batch_size=self.cfg.batch_size, shuffle=shuffle, num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
-<<<<<<< HEAD
             prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last if shuffle else False,
             collate_fn=cf
-=======
-            prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last, collate_fn=cf
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
         )
 
     def train_loader(self) -> DataLoader:
@@ -389,17 +336,4 @@ class DataModule:
         return self._make_loader(self.cfg.val_data, shuffle=False)
 
     def test_loader(self) -> DataLoader:
-<<<<<<< HEAD
         return self._make_loader(self.cfg.test_data, shuffle=False)
-=======
-        ds = DTIDataset(self.cfg.test_csv, self.esm2_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
-        if not self.cfg.sequence:
-            cf = self._collate_v1
-        else:
-            cf = self._collate_v2
-        return DataLoader(
-            ds, batch_size=self.cfg.batch_size, shuffle=False, num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
-            prefetch_factor=self.cfg.prefetch_factor, drop_last=False, collate_fn=cf
-        )
->>>>>>> c45b53e3a067a7d80114a697f327ff65c138d752
