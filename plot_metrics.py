@@ -1,154 +1,112 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Plot training curves from ugca-dti outputs with optional edge trimming and better smoothing.
+Make a 2x3 panel image for AUROC/AUPRC/F1/ACC/SEN/MCC from metrics.csv.
+Each metric is drawn as its own matplotlib figure (no subplots), then
+stitched into a single PNG via PIL. Also supports batch mode for all folds.
 
 Usage:
-  python plot_metrics.py --out /root/lanyun-tmp/ugca-runs/davis --grid --smooth 5 --trim 1
+  # one fold
+  python plot_metrics_panel.py "/root/lanyun-tmp/ugca-runs/DAVIS-cold-protein-seq-s42/fold1"
+
+  # all folds under a run root
+  python plot_metrics_panel.py "/root/lanyun-tmp/ugca-runs/DAVIS-cold-protein-seq-s42" --all-folds
 """
-import argparse, time, sys, os
-from pathlib import Path
-import numpy as np
+import argparse, os, glob, tempfile
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from PIL import Image
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--out", required=True, help="Path to a dataset run dir, e.g., /root/lanyun-tmp/ugca-runs/davis")
-    p.add_argument("--metrics", nargs="*", default=["AUROC","AUPRC","F1","ACC","SEN","MCC"])
-    p.add_argument("--dpi", type=int, default=160)
-    p.add_argument("--smooth", type=int, default=0, help="centered moving average window; 0 disables")
-    p.add_argument("--trim", type=int, default=0, help="drop N epochs at both start and end when plotting")
-    p.add_argument("--grid", action="store_true", help="also render a 2x3 grid with all metrics")
-    p.add_argument("--watch", type=float, default=0.0, help="seconds between refresh; 0 for one-shot")
-    return p.parse_args()
+METRICS = ["AUROC","AUPRC","F1","ACC","SEN","MCC"]
 
-def load_folds(run_dir: Path):
-    folds = {}
-    for fdir in sorted(run_dir.glob("fold*")):
-        csv_path = fdir / "metrics.csv"
-        if not csv_path.exists():
+def draw_curve(x, y, title, ylabel, out_png):
+    plt.figure()
+    plt.plot(x, y)
+    plt.xlabel("Epoch")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True)
+    plt.savefig(out_png, dpi=160, bbox_inches="tight")
+    plt.close()
+
+def make_panel(png_paths, out_png, rows=2, cols=3, pad=20, bg=(255,255,255)):
+    # open and normalize size
+    imgs = [Image.open(p) for p in png_paths]
+    # resize to the smallest size among them to keep quality more consistent
+    w = min(im.size[0] for im in imgs)
+    h = min(im.size[1] for im in imgs)
+    imgs = [im.resize((w, h)) for im in imgs]
+
+    W = cols * w + (cols + 1) * pad
+    H = rows * h + (rows + 1) * pad
+    panel = Image.new("RGB", (W, H), color=bg)
+
+    for idx, im in enumerate(imgs):
+        r = idx // cols
+        c = idx % cols
+        x = pad + c * (w + pad)
+        y = pad + r * (h + pad)
+        panel.paste(im, (x, y))
+
+    panel.save(out_png)
+
+def process_fold(fold_dir: str):
+    csv_path = os.path.join(fold_dir, "metrics.csv")
+    if not os.path.exists(csv_path):
+        print(f"[skip] {csv_path} not found")
+        return None
+
+    df = pd.read_csv(csv_path)
+    if "epoch" not in df.columns:
+        print(f"[skip] epoch column not in {csv_path}")
+        return None
+
+    tmp_pngs = []
+    for m in METRICS:
+        if m not in df.columns:  # skip missing metrics
             continue
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception as e:
-            print(f"[WARN] failed to read {csv_path}: {e}", file=sys.stderr)
-            continue
-        mask_num = pd.to_numeric(df.get("epoch", pd.Series([], dtype=str)), errors="coerce").notna()
-        df_curve = df[mask_num].copy()
-        if not df_curve.empty:
-            df_curve["epoch"] = df_curve["epoch"].astype(int)
-            df_curve.sort_values("epoch", inplace=True)
-        df_best = df[~mask_num].copy()
-        best_row = df_best.iloc[-1].to_dict() if not df_best.empty else None
-        folds[fdir.name] = {"curve": df_curve, "best": best_row}
-    return folds
+        out_png = os.path.join(fold_dir, f"_tmp_{m.lower()}.png")
+        draw_curve(df["epoch"].values, df[m].values, m, m, out_png)
+        tmp_pngs.append(out_png)
 
-def centered_ma(y, k):
-    if k <= 1 or len(y) < k:
-        return y
-    pad = k//2
-    ypad = np.pad(y, (pad, pad), mode="edge")  # edge-pad to avoid boundary dip
-    kernel = np.ones(k, dtype=float) / k
-    out = np.convolve(ypad, kernel, mode="valid")
-    return out
+    if not tmp_pngs:
+        print(f"[warn] no metrics found to plot in {csv_path}")
+        return None
 
-def maybe_trim(x, y, trim):
-    if trim <= 0 or len(x) <= 2*trim:
-        return x, y
-    return x[trim:-trim], y[trim:-trim]
-
-def render(run_dir: Path, metrics, dpi=160, smooth=0, trim=0, grid=False):
-    folds = load_folds(run_dir)
-    plot_dir = run_dir / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
-    saved = []
-
-    # individual curves
-    for m in metrics:
+    # If less than 6 metrics, pad with blank images so the grid is consistent
+    while len(tmp_pngs) < 6:
+        # create a simple blank canvas
+        blank = os.path.join(fold_dir, f"_tmp_blank_{len(tmp_pngs)}.png")
         plt.figure()
-        xs_ref = None
-        Ys = []
-        any_line = False
-        for fold, pack in folds.items():
-            df = pack["curve"]
-            if df is None or df.empty or m not in df.columns:
-                continue
-            x = df["epoch"].to_numpy()
-            y = df[m].to_numpy(dtype=float)
-            if smooth and smooth > 1:
-                y = centered_ma(y, smooth)
-            x, y = maybe_trim(x, y, trim)
-            if len(x)==0:
-                continue
-            plt.plot(x, y, label=fold, alpha=0.8)
-            any_line = True
-            if xs_ref is None: xs_ref = x
-            Ys.append(np.interp(xs_ref, x, y))
-        if any_line and Ys:
-            mean = np.vstack(Ys).mean(0)
-            plt.plot(xs_ref, mean, label="mean", linewidth=3, zorder=10)
-        plt.title(f"{m}")
-        plt.xlabel("epoch"); plt.ylabel(m)
-        plt.grid(True, linestyle="--", alpha=0.3)
-        if any_line: plt.legend()
-        out_path = plot_dir / f"{m.lower()}_curve.png"
-        plt.tight_layout(); plt.savefig(out_path, dpi=dpi); plt.close()
-        saved.append(out_path)
+        plt.plot([], [])
+        plt.xlabel("Epoch"); plt.ylabel("")
+        plt.title("")
+        plt.grid(True)
+        plt.savefig(blank, dpi=160, bbox_inches="tight")
+        plt.close()
+        tmp_pngs.append(blank)
 
-    # grid
-    if grid:
-        rows, cols = 2, 3
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*4.5, rows*3.6), dpi=dpi)
-        ax_list = axes.flatten()
-        for ax, m in zip(ax_list, metrics):
-            xs_ref = None; Ys=[]; any_line=False
-            for fold,pack in folds.items():
-                df = pack["curve"]
-                if df is None or df.empty or m not in df.columns:
-                    continue
-                x = df["epoch"].to_numpy(); y = df[m].to_numpy(dtype=float)
-                if smooth and smooth > 1: y = centered_ma(y, smooth)
-                x, y = maybe_trim(x, y, trim)
-                if len(x)==0: continue
-                ax.plot(x, y, label=fold, alpha=0.8); any_line=True
-                if xs_ref is None: xs_ref = x
-                Ys.append(np.interp(xs_ref, x, y))
-            if any_line and Ys:
-                mean = np.vstack(Ys).mean(0)
-                ax.plot(xs_ref, mean, label="mean", linewidth=3, zorder=10)
-            ax.set_title(m); ax.set_xlabel("epoch"); ax.set_ylabel(m)
-            ax.grid(True, linestyle="--", alpha=0.3)
-            if any_line: ax.legend(fontsize=8)
-        for k in range(len(metrics), len(ax_list)):
-            ax_list[k].axis("off")
-        fig.tight_layout()
-        grid_path = plot_dir / "all_metrics_grid.png"
-        fig.savefig(grid_path, dpi=dpi)
-        plt.close(fig)
-        saved.append(grid_path)
-
-    return saved
+    out_panel = os.path.join(fold_dir, "metrics_panel.png")
+    make_panel(tmp_pngs[:6], out_panel)
+    print("[saved]", out_panel)
+    return out_panel
 
 def main():
-    args = parse_args()
-    run_dir = Path(args.out)
-    if not run_dir.exists():
-        print(f"[ERR] --out path not found: {run_dir}", file=sys.stderr); sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", help="path to fold dir (…/fold1) or run root (…/DATASET-cold-xxx)")
+    ap.add_argument("--all-folds", action="store_true", help="if path is run root, process all fold*/ dirs")
+    args = ap.parse_args()
 
-    if args.watch and args.watch > 0:
-        print(f"[watching] {run_dir} every {args.watch}s ... Ctrl+C to stop.")
-        while True:
-            saved = render(run_dir, args.metrics, dpi=args.dpi, smooth=args.smooth, trim=args.trim, grid=args.grid)
-            for p in saved: print(f"[OK] {p}")
-            time.sleep(args.watch)
+    # detect
+    is_fold = os.path.basename(args.path).startswith("fold") or os.path.exists(os.path.join(args.path, "metrics.csv"))
+    if is_fold:
+        process_fold(args.path)
     else:
-        saved = render(run_dir, args.metrics, dpi=args.dpi, smooth=args.smooth, trim=args.trim, grid=args.grid)
-        print("[OK] saved files:")
-        for p in saved: print(" -", p)
+        if args.all_folds:
+            for fd in sorted(glob.glob(os.path.join(args.path, "fold*", ""))):
+                process_fold(fd)
+        else:
+            print("You passed a run root. Add --all-folds to process all fold*/ dirs.")
 
 if __name__ == "__main__":
     main()
