@@ -1,4 +1,3 @@
-# src/train.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, time, math, argparse, importlib, inspect, csv
@@ -70,7 +69,7 @@ def find_best_threshold(prob: np.ndarray, y_true: np.ndarray, grid: np.ndarray |
     return float(best_t)
 
 # ---------- model loader ----------
-def build_model_from_src(dims: CacheDims, prefer_class: str | None = None, sequence: bool = False) -> nn.Module:
+def build_model_from_src(dims: CacheDims, args) -> nn.Module:
     model_mod = importlib.import_module("src.model")
     if hasattr(model_mod, "build_model"):
         print("[Model] 使用 src.model.build_model(cfg)")
@@ -79,14 +78,36 @@ def build_model_from_src(dims: CacheDims, prefer_class: str | None = None, seque
             "d_molclr":  int(dims.molclr),
             "d_chem":    int(dims.chemberta),
             "d_model":   512, "dropout": 0.1, "act": "silu",
-            "mutan_rank": 10, "mutan_dim": 512, "head_hidden": 512,
-            "sequence": bool(sequence),
-            "nhead": 4, "nlayers": 2
+            "sequence": bool(args.sequence),
+            # seq-only
+            "nhead": 4, "nlayers": 2,
+            "fusion": args.fusion,
+            "mutan_rank": args.mutan_rank,
+            "mutan_dim": args.mutan_dim,
+            "head_hidden": 512,
+            # gate
+            "gate_type": args.gate_type,
+            "gate_mode": args.gate_mode,
+            "gate_lambda": args.gate_lambda,
+            "g_min": args.g_min,
+            "smooth_g": args.smooth_g,
+            "topk_ratio": args.topk_ratio,
+            # cross-attn
+            "attn_temp": getattr(args, "attn_temp", 1.0),
+            # pooling
+            "pool_type": args.pool_type,
+            # drug fuse
+            "drug_fuse": args.drug_fuse,
+            "strict_concat_ln": args.strict_concat_ln,
+            "chem_dim": int(dims.chemberta),
+            # regularization
+            "entropy_reg": args.entropy_reg,
         }
         return getattr(model_mod, "build_model")(cfg)
 
-    cand_names = [prefer_class] if prefer_class else []
-    cand_names += ["UGCAModel", "UGCASeqModel", "UGCA", "Model"]
+    # 回退：按类名查找
+    cand_names = [args.model_class] if args.model_class else []
+    cand_names += ["UGCASeqModel" if args.sequence else "UGCAModel", "UGCA", "Model"]
     for name in cand_names:
         if not name: continue
         c = getattr(model_mod, name, None)
@@ -118,7 +139,9 @@ def _forward_any(model: nn.Module, batch):
         return logits, y
 
 def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimizer: optim.Optimizer,
-                tag: str, ep: int, ep_total: int, gate_budget: float = 0.0, gate_rho: float = 0.6) -> Tuple[float, float]:
+                tag: str, ep: int, ep_total: int, gate_budget: float = 0.0, gate_rho: float = 0.6,
+                amp_mode: str = "off", scaler: Optional[torch.cuda.amp.GradScaler] = None,
+                amp_dtype: Optional[torch.dtype] = None) -> Tuple[float, float]:
     model.train(True)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
@@ -130,22 +153,47 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, opti
 
     for batch in loader:
         batch = _batch_to_device(batch, device)
-        logits, y = _forward_any(model, batch)
-        loss = bce(logits, y)
 
-        # 门控预算正则（若模型实现了 last_gates 钩子）
-        if gate_budget > 0.0 and hasattr(model, "last_gates"):
-            gd, gp = model.last_gates()
-            if gd is not None and gp is not None:
-                def _mean1d(g): return g.mean(dim=1).mean()
-                Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
-                loss = loss + gate_budget * Lb
-
+        # --- forward ---
+        use_amp = amp_mode != "off"
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        optimizer.step()
 
+        if use_amp:
+            with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
+                                dtype=amp_dtype, enabled=True):
+                logits, y = _forward_any(model, batch)
+                loss = bce(logits, y)
+                # 门控预算正则
+                if gate_budget > 0.0 and hasattr(model, "last_gates"):
+                    gd, gp = model.last_gates()
+                    if gd is not None and gp is not None:
+                        def _mean1d(g): return g.mean(dim=1).mean()
+                        Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
+                        loss = loss + gate_budget * Lb
+        else:
+            logits, y = _forward_any(model, batch)
+            loss = bce(logits, y)
+            if gate_budget > 0.0 and hasattr(model, "last_gates"):
+                gd, gp = model.last_gates()
+                if gd is not None and gp is not None:
+                    def _mean1d(g): return g.mean(dim=1).mean()
+                    Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
+                    loss = loss + gate_budget * Lb
+
+        # --- backward ---
+        if amp_mode == "fp16":
+            assert scaler is not None
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+
+        # --- logging ---
         bs = y.size(0)
         tot += float(loss.detach().cpu())
         n_seen += bs
@@ -156,20 +204,29 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, opti
     pbar.close()
     return tot / max(1, n_seen / bs), time.time() - t0
 
-def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, np.ndarray, np.ndarray, float]:
+@torch.no_grad()
+def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
+               amp_mode: str = "off", amp_dtype: Optional[torch.dtype] = None) -> Tuple[float, np.ndarray, np.ndarray, float]:
     model.train(False)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
     probs, labels = [], []
     t0 = time.time()
 
+    use_amp = amp_mode != "off"
     for batch in loader:
         batch = _batch_to_device(batch, device)
-        with torch.no_grad():
+        if use_amp:
+            with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
+                                dtype=amp_dtype, enabled=True):
+                logits, y = _forward_any(model, batch)
+                loss = bce(logits, y)
+        else:
             logits, y = _forward_any(model, batch)
             loss = bce(logits, y)
+
         tot += float(loss.detach().cpu())
-        probs.append(torch.sigmoid(logits).detach().cpu().numpy())
+        probs.append(torch.sigmoid(logits.float()).detach().cpu().numpy())
         labels.append(y.detach().cpu().numpy())
 
     prob = np.concatenate(probs, axis=0) if probs else np.zeros((0,), dtype=np.float32)
@@ -180,17 +237,36 @@ def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tu
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="如 DAVIS / BindingDB / BioSNAP（大小写不敏感）")
-    ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--model-class", default="", help="通常不用；除非你显式选类（如 UGCASeqModel）")
     ap.add_argument("--seed", type=int, default=42)
 
-    # 模型形态与门控
+    # 模型形态与门控/融合/池化
     ap.add_argument("--sequence", action="store_true", help="启用 per-token（序列级）模式")
-    ap.add_argument("--gate-budget", type=float, default=0.0, help="门控预算正则系数 λb（0 关闭）")
-    ap.add_argument("--gate-rho", type=float, default=0.6, help="目标平均开度 ρ（一般 0.6 左右）")
+    ap.add_argument("--fusion", type=str, default="mutan", choices=["mutan","concat","block","mcb"])
+    ap.add_argument("--mutan-rank", type=int, default=10)
+    ap.add_argument("--mutan-dim", type=int, default=512)
+    ap.add_argument("--pool-type", type=str, default="attn", choices=["attn","mean"])
+    ap.add_argument("--attn_temp", type=float, default=1.0,
+                    help="Cross-attention 的温度缩放系数，默认 1.0")
+
+    ap.add_argument("--gate-type", type=str, default="evidential", choices=["evidential","mlp"])
+    ap.add_argument("--gate-mode", type=str, default="mu_times_evi", choices=["mu_times_evi","evi_only","mu_only"])
+    ap.add_argument("--gate-lambda", type=float, default=2.0)
+    ap.add_argument("--g-min", type=float, default=0.05)
+    ap.add_argument("--smooth-g", action="store_true")
+    ap.add_argument("--topk-ratio", type=float, default=0.0)
+    ap.add_argument("--entropy-reg", type=float, default=0.0)
+
+    ap.add_argument("--drug-fuse", type=str, default="pool_concat", choices=["pool_concat","inject"],
+                    help="序列模型：先池化再 concat+LN（pool_concat），或把 chem 注入 token（inject）")
+    ap.add_argument("--strict-concat-ln", action="store_true", help="启用 concat 后的 LayerNorm（严格对齐）")
+
+    # AMP
+    ap.add_argument("--amp", type=str, choices=["off","fp16","bf16"], default="off")
 
     # 冷启动设置：默认 5 折；整体比例默认 0.7/0.1/0.2
     ap.add_argument("--split-mode", choices=["cold-protein", "cold-drug"], default="cold-protein")
@@ -200,7 +276,13 @@ def parse_args():
     ap.add_argument("--thr", default="auto",
                     help="决策阈值；'auto'=在验证集上选择使F1最大的阈值；或显式给出如 0.35")
 
-    # —— 新增：稳定命名 & 断点续训 —— #
+    # 门控预算正则（缺省为关闭）
+    ap.add_argument("--gate-budget", dest="gate_budget", type=float, default=0.0,
+                    help="证据门控的预算正则系数，0 表示关闭")
+    ap.add_argument("--gate-rho", dest="gate_rho", type=float, default=0.6,
+                    help="门控期望开启比例 ρ，用于预算正则的目标")
+
+    # 输出与断点续训
     ap.add_argument("--out-dir", default="",
                     help="可选：自定义输出根目录；不设则默认 /root/lanyun-tmp/ugca-runs/<DATASET>-cold-{protein|drug}[-seq][-suffix]")
     ap.add_argument("--suffix", default="", help="可选：给目录添加自定义后缀，如 '-seq'、'-s42'")
@@ -233,6 +315,11 @@ if __name__ == "__main__":
         try: print("gpu:", torch.cuda.get_device_name(0))
         except Exception: pass
 
+    # AMP 设置
+    amp_mode = args.amp
+    amp_dtype = torch.float16 if amp_mode == "fp16" else (torch.bfloat16 if amp_mode == "bf16" else None)
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_mode == "fp16"))
+
     # ---- 自动路径 ----
     ds_lower = args.dataset.lower()
     ds_cap   = {"bindingdb":"BindingDB", "davis":"DAVIS", "biosnap":"BioSNAP"}.get(ds_lower, args.dataset)
@@ -262,7 +349,7 @@ if __name__ == "__main__":
     # 在候选训练池(80%)里抽取 val，使整体比例达到 overall_val（默认 0.1）
     val_frac_in_pool = args.overall_val / (1.0 - overall_test)  # 0.1 / 0.8 = 0.125
     print(f"[SPLIT] 模式={args.split_mode} | 折数={len(outer_splits)} | 目标整体比例 train:val:test = {args.overall_train}:{args.overall_val}:{overall_test:.1f}")
-    print(f"[SPLIT] 实施策略：每折 test=1/5；在其余 4/5 的候选池按组随机抽取 {val_frac_in_pool*100:.1f}% 的组做 val，其余做 train（保持组不交叠）")
+    print(f"[SPLIT] 策略：每折 test=1/5；在其余 4/5 的候选池按组随机抽取 {val_frac_in_pool*100:.1f}% 的组做 val，其余做 train（保持组不交叠）")
 
     # ---- 输出主目录（稳定命名，不含时间戳）----
     split_tag = "cold-protein" if args.split_mode == "cold-protein" else "cold-drug"
@@ -309,7 +396,7 @@ if __name__ == "__main__":
         test_loader  = dm.test_loader()
 
         # ---- Model / Optim ----
-        model = build_model_from_src(dims, args.model_class, sequence=args.sequence).to(device)
+        model = build_model_from_src(dims, args).to(device)
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
         fold_dir = out_dir / f"fold{t}"
@@ -351,10 +438,14 @@ if __name__ == "__main__":
             print(f"[RESUME] fold{t} 从 epoch {start_epoch} 继续")
 
         for ep in range(start_epoch, args.epochs + 1):
-            tr_loss, tr_t = train_epoch(model, train_loader, device, optimizer,
-                                        tag=f"{ds_lower}/train/fold{t}", ep=ep, ep_total=args.epochs,
-                                        gate_budget=args.gate_budget, gate_rho=args.gate_rho)
-            va_loss, prob, y, va_t = eval_epoch(model, val_loader, device)
+            tr_loss, tr_t = train_epoch(
+                model, train_loader, device, optimizer,
+                tag=f"{ds_lower}/train/fold{t}", ep=ep, ep_total=args.epochs,
+                gate_budget=getattr(args, "gate_budget", 0.0),
+                gate_rho=getattr(args, "gate_rho", 0.6),
+                amp_mode=amp_mode, scaler=scaler, amp_dtype=amp_dtype
+            )
+            va_loss, prob, y, va_t = eval_epoch(model, val_loader, device, amp_mode=amp_mode, amp_dtype=amp_dtype)
             thr_now = find_best_threshold(prob, y) if (str(args.thr).lower() == "auto") else float(args.thr)
             m = compute_metrics(prob, y, thr=thr_now)
 
@@ -392,7 +483,7 @@ if __name__ == "__main__":
         if ckpt_best.exists():
             sd = torch.load(str(ckpt_best), map_location="cpu")
             model.load_state_dict(sd["state_dict"])
-        te_loss, prob, y, te_t = eval_epoch(model, test_loader, device)
+        te_loss, prob, y, te_t = eval_epoch(model, test_loader, device, amp_mode=amp_mode, amp_dtype=amp_dtype)
         te_m = compute_metrics(prob, y, thr=best_thr)
         print(f"[TEST/fold{t}] thr={best_thr:.4f} | {fmt1(te_m)} | loss {te_loss:.4f} | time {te_t:.1f}s")
 
@@ -412,6 +503,5 @@ if __name__ == "__main__":
     std  = {k: float(np.std ([m[k] for m in test_metrics_all])) for k in keys}
     with open(out_dir / "cv_summary.csv", "w", newline="") as f:
         w = csv.writer(f); w.writerow(["metric","mean","std"])
-        for k in keys: w.writerow([k.upper()],)
         for k in keys: w.writerow([k.upper(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
     print("[CV] " + " | ".join([f"{k.upper()} {mean[k]:.4f}±{std[k]:.4f}" for k in keys]))

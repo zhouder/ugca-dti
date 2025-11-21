@@ -48,10 +48,19 @@
    python -m src.train \
    --dataset DAVIS \
    --sequence \
-   --epochs 100 --batch-size 64 --workers 6 --lr 5e-5 \
-   --split-mode cold-protein \        # 或 cold-drug
-   --cv-folds 5 \                     # 冷启动K折（默认5）
-   --thr auto \                       # 自适应阈值（验证集上选 F1 最优阈值）
-   --gate-budget 0.001 --gate-rho 0.6
+   --pool-type attn \
+   --drug-fuse pool_concat --strict-concat-ln \
+   --fusion mutan --mutan-rank 10 --mutan-dim 512 \
+   --gate-type evidential --gate-mode evi_only --gate-lambda 1.0 --g-min 0.05 \
+   --smooth-g \
+   --attn_temp 1.0 \
+   --topk-ratio 0.0 \
+   --amp bf16 \
+   --split-mode cold-protein --cv-folds 5 \
+   --overall-train 0.7 --overall-val 0.1 \
+   --batch-size 64 --epochs 100 --lr 5e-5 \
+   --thr auto \
+   --gate-budget 0.0 --gate-rho 0.6 \
+   --suffix doc-aligned --seed 42
    ```
     当中断训练，利用添加--resume继续训练（采用`last.pt`）
