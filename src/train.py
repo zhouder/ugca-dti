@@ -140,8 +140,7 @@ def _forward_any(model: nn.Module, batch):
 
 def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimizer: optim.Optimizer,
                 tag: str, ep: int, ep_total: int, gate_budget: float = 0.0, gate_rho: float = 0.6,
-                amp_mode: str = "off", scaler: Optional[torch.cuda.amp.GradScaler] = None,
-                amp_dtype: Optional[torch.dtype] = None) -> Tuple[float, float]:
+                amp_mode: str = "off", scaler=None, amp_dtype=None) -> Tuple[float, float]:
     model.train(True)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
@@ -206,7 +205,7 @@ def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, opti
 
 @torch.no_grad()
 def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
-               amp_mode: str = "off", amp_dtype: Optional[torch.dtype] = None) -> Tuple[float, np.ndarray, np.ndarray, float]:
+               amp_mode: str = "off", amp_dtype=None) -> Tuple[float, np.ndarray, np.ndarray, float]:
     model.train(False)
     bce = nn.BCEWithLogitsLoss()
     tot = 0.0
@@ -287,6 +286,14 @@ def parse_args():
                     help="可选：自定义输出根目录；不设则默认 /root/lanyun-tmp/ugca-runs/<DATASET>-cold-{protein|drug}[-seq][-suffix]")
     ap.add_argument("--suffix", default="", help="可选：给目录添加自定义后缀，如 '-seq'、'-s42'")
     ap.add_argument("--resume", action="store_true", help="断点续训：已完成的折自动跳过；存在 last.pth 时从其 epoch+1 继续")
+
+    # ===== 新增：Step Decay 学习率调度 =====
+    ap.add_argument("--lr-sched", type=str, choices=["off","step"], default="off",
+                    help="学习率调度器：off=恒定学习率；step=StepLR（按 epoch 阶梯衰减）")
+    ap.add_argument("--step-size", type=int, default=20,
+                    help="StepLR 的 step_size（每隔多少个 epoch 衰减一次）")
+    ap.add_argument("--gamma", type=float, default=0.1,
+                    help="StepLR 的 gamma（每次衰减倍率，0.1 表示学习率*0.1）")
     return ap.parse_args()
 
 # ---------- helpers for split ----------
@@ -399,6 +406,13 @@ if __name__ == "__main__":
         model = build_model_from_src(dims, args).to(device)
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
+        # ===== 新增：StepLR（按 epoch 阶梯衰减） =====
+        scheduler = None
+        if getattr(args, "lr_sched", "off") == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=args.step_size, gamma=args.gamma
+            )
+
         fold_dir = out_dir / f"fold{t}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         ckpt_best = fold_dir / "best.pth"
@@ -428,6 +442,9 @@ if __name__ == "__main__":
                 model.load_state_dict(sd["state_dict"])
                 if "optimizer" in sd and sd["optimizer"]:
                     optimizer.load_state_dict(sd["optimizer"])
+                # 恢复 scheduler（若有）
+                if "scheduler" in sd and sd["scheduler"] and scheduler is not None:
+                    scheduler.load_state_dict(sd["scheduler"])
             except Exception:
                 pass
             start_epoch = int(sd.get("epoch", 0)) + 1
@@ -457,20 +474,26 @@ if __name__ == "__main__":
                             f"{tr_t:.1f}", f"{va_t:.1f}", f"{thr_now:.6f}"])
             print(f"[{ds_lower}/fold{t}] ep{ep:03d} | train_loss {tr_loss:.4f} | val_loss {va_loss:.4f} | {fmt1(m)} | thr {thr_now:.3f}")
 
-            score = (m["auroc"] if not math.isnan(m["auroc"]) else m["acc"])
+            # 学习率调度：每个 epoch 结束后 step 一次
+            if scheduler is not None:
+                scheduler.step()
+
+            score = (m["auprc"] if not math.isnan(m["auprc"]) else m["acc"])
             if score > best_score:
                 best_score  = score
                 best_epoch  = ep
                 best_metrics= dict(m)
                 best_thr    = float(thr_now)
                 torch.save({"epoch": ep, "state_dict": model.state_dict(),
-                            "metrics": m, "optimizer": optimizer.state_dict()}, str(ckpt_best))
+                            "metrics": m, "optimizer": optimizer.state_dict(),
+                            "scheduler": (scheduler.state_dict() if scheduler is not None else None)}, str(ckpt_best))
 
             # 保存 last.pth（每个 epoch 都覆盖）
             torch.save({
                 "epoch": ep,
                 "state_dict": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": (scheduler.state_dict() if scheduler is not None else None),
                 "best_thr": best_thr,
                 "best_score": best_score,
                 "best_epoch": best_epoch,
