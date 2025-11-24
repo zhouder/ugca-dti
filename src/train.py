@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, time, math, argparse, importlib, inspect, csv
+import os, time, math, argparse, importlib, inspect, csv, copy
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -18,7 +18,8 @@ try:
         roc_auc_score, average_precision_score, f1_score,
         accuracy_score, recall_score, matthews_corrcoef
     )
-    from sklearn.model_selection import GroupKFold
+    from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, StratifiedShuffleSplit
+    from src.splits import make_outer_splits, sample_val_indices
     SKLEARN = True
 except Exception:
     SKLEARN = False
@@ -249,12 +250,12 @@ def parse_args():
     ap.add_argument("--mutan-rank", type=int, default=10)
     ap.add_argument("--mutan-dim", type=int, default=512)
     ap.add_argument("--pool-type", type=str, default="attn", choices=["attn","mean"])
-    ap.add_argument("--attn_temp", type=float, default=1.0,
+    ap.add_argument("--attn_temp", type=float, default=0.8,
                     help="Cross-attention 的温度缩放系数，默认 1.0")
 
     ap.add_argument("--gate-type", type=str, default="evidential", choices=["evidential","mlp"])
-    ap.add_argument("--gate-mode", type=str, default="mu_times_evi", choices=["mu_times_evi","evi_only","mu_only"])
-    ap.add_argument("--gate-lambda", type=float, default=2.0)
+    ap.add_argument("--gate-mode", type=str, default="evi_only", choices=["mu_times_evi","evi_only","mu_only"])
+    ap.add_argument("--gate-lambda", type=float, default=1.0)
     ap.add_argument("--g-min", type=float, default=0.05)
     ap.add_argument("--smooth-g", action="store_true")
     ap.add_argument("--topk-ratio", type=float, default=0.0)
@@ -265,10 +266,13 @@ def parse_args():
     ap.add_argument("--strict-concat-ln", action="store_true", help="启用 concat 后的 LayerNorm（严格对齐）")
 
     # AMP
-    ap.add_argument("--amp", type=str, choices=["off","fp16","bf16"], default="off")
+    ap.add_argument("--amp", type=str, choices=["off","fp16","bf16"], default="bf16")
 
     # 冷启动设置：默认 5 折；整体比例默认 0.7/0.1/0.2
-    ap.add_argument("--split-mode", choices=["cold-protein", "cold-drug"], default="cold-protein")
+    ap.add_argument("--split-mode",
+                    choices=["warm", "hot", "cold-protein", "cold-drug", "cold-both", "cold-pair"],
+                    default="cold-protein")
+
     ap.add_argument("--cv-folds", type=int, default=5)
     ap.add_argument("--overall-train", type=float, default=0.7)
     ap.add_argument("--overall-val",   type=float, default=0.1)
@@ -276,7 +280,7 @@ def parse_args():
                     help="决策阈值；'auto'=在验证集上选择使F1最大的阈值；或显式给出如 0.35")
 
     # 门控预算正则（缺省为关闭）
-    ap.add_argument("--gate-budget", dest="gate_budget", type=float, default=0.0,
+    ap.add_argument("--gate-budget", dest="gate_budget", type=float, default=1e-3,
                     help="证据门控的预算正则系数，0 表示关闭")
     ap.add_argument("--gate-rho", dest="gate_rho", type=float, default=0.6,
                     help="门控期望开启比例 ρ，用于预算正则的目标")
@@ -294,6 +298,9 @@ def parse_args():
                     help="StepLR 的 step_size（每隔多少个 epoch 衰减一次）")
     ap.add_argument("--gamma", type=float, default=0.1,
                     help="StepLR 的 gamma（每次衰减倍率，0.1 表示学习率*0.1）")
+    ap.add_argument("--early-stop", type=int, default=15, help="patience；0 表示关闭")
+    ap.add_argument("--es-min-delta", type=float, default=0.0, help="最小提升幅度，超过才算改进")
+
     return ap.parse_args()
 
 # ---------- helpers for split ----------
@@ -348,18 +355,25 @@ if __name__ == "__main__":
     N = len(labels)
     print(f"[ALL] loaded: {N} rows from {all_csv}")
 
-    # ---- 外层：按 group 的 K 折，用于 test ----
-    groups_all = np.asarray(proteins if args.split_mode == "cold-protein" else smiles)
-    gkf = GroupKFold(n_splits=args.cv_folds if args.cv_folds > 1 else 5)
-    outer_splits = list(gkf.split(np.arange(N), groups=groups_all))
+    # ---- 构建外层K折，用于 test ----
+    prot_key = np.asarray(proteins)
+    drug_key = np.asarray(smiles)
+    split_mode = "warm" if args.split_mode == "hot" else args.split_mode
+
+    outer_splits = make_outer_splits(
+        split_mode,
+        args.cv_folds if args.cv_folds > 1 else 5,
+        args.seed,
+        drug_key, prot_key, np.asarray(labels)
+    )
     overall_test = 1.0 / len(outer_splits)
-    # 在候选训练池(80%)里抽取 val，使整体比例达到 overall_val（默认 0.1）
     val_frac_in_pool = args.overall_val / (1.0 - overall_test)  # 0.1 / 0.8 = 0.125
-    print(f"[SPLIT] 模式={args.split_mode} | 折数={len(outer_splits)} | 目标整体比例 train:val:test = {args.overall_train}:{args.overall_val}:{overall_test:.1f}")
-    print(f"[SPLIT] 策略：每折 test=1/5；在其余 4/5 的候选池按组随机抽取 {val_frac_in_pool*100:.1f}% 的组做 val，其余做 train（保持组不交叠）")
+    print(
+        f"[SPLIT] 模式={split_mode} | 折数={len(outer_splits)} | 目标总体比例 train:val:test = {args.overall_train}:{args.overall_val}:{overall_test:.1f}")
+    print("[SPLIT] 实施策略：每折 test=1/K；在其余 (1-1/K) 的候选池按模式抽取 val，其余做 train；冷模式均按组不交叠")
 
     # ---- 输出主目录（稳定命名，不含时间戳）----
-    split_tag = "cold-protein" if args.split_mode == "cold-protein" else "cold-drug"
+    split_tag = split_mode
     base = args.out_dir if args.out_dir else f"/root/lanyun-tmp/ugca-runs/{ds_cap}-{split_tag}"
     if args.sequence:
         base += "-seq"
@@ -371,10 +385,30 @@ if __name__ == "__main__":
 
     # ---- 逐折训练 ----
     test_metrics_all: List[Dict[str, float]] = []
-    for t, (_, te_idx) in enumerate(outer_splits, 1):
+    for t, te_idx in enumerate(outer_splits, 1):
         te_idx = np.asarray(te_idx)
-        pool_idx = np.setdiff1d(np.arange(N), te_idx)
-        tr_idx, va_idx = sample_val_from_pool_by_groups(pool_idx, groups_all, val_frac_in_pool, seed=args.seed + t)
+        if split_mode == "cold-both":
+            # 严格双冷：训练/验证去除任何含测试药物或测试蛋白的样本
+            td = set(drug_key[te_idx]);
+            tp = set(prot_key[te_idx])
+            pool_mask = np.array([(d not in td) and (p not in tp) for d, p in zip(drug_key, prot_key)], dtype=bool)
+            pool_idx = np.where(pool_mask)[0]
+        else:
+            pool_idx = np.setdiff1d(np.arange(N), te_idx)
+
+        tr_idx, va_idx = sample_val_indices(
+            split_mode, pool_idx, val_frac_in_pool, seed=args.seed + t,
+            drug_key=drug_key, prot_key=prot_key, labels=np.asarray(labels)
+        )
+        if split_mode.startswith("cold"):
+            set_tr_p, set_va_p, set_te_p = set([proteins[i] for i in tr_idx]), set([proteins[i] for i in va_idx]), set(
+                [proteins[i] for i in te_idx])
+            set_tr_d, set_va_d, set_te_d = set([smiles[i] for i in tr_idx]), set([smiles[i] for i in va_idx]), set(
+                [smiles[i] for i in te_idx])
+            print(
+                f"[fold{t}] overlap P: tr∩va={len(set_tr_p & set_va_p)}, tr∩te={len(set_tr_p & set_te_p)}, va∩te={len(set_va_p & set_te_p)} | "
+                f"D: tr∩va={len(set_tr_d & set_va_d)}, tr∩te={len(set_tr_d & set_te_d)}, va∩te={len(set_va_d & set_te_d)}")
+
 
         def slice_trip(idx):
             return [smiles[i] for i in idx], [proteins[i] for i in idx], [labels[i] for i in idx]
@@ -431,10 +465,13 @@ if __name__ == "__main__":
             w.writerow(["epoch","train_loss","val_loss","AUROC","AUPRC","F1","ACC","SEN","MCC","time_train_s","time_val_s","thr"])
 
         best_score = -1.0
-        best_epoch = -1
-        best_metrics = {}
+        best_state = None
         best_thr = 0.5
+        best_metrics = {}
         start_epoch = 1
+
+        no_improve = 0
+        best_epoch = 0
 
         if args.resume and ckpt_last.exists():
             sd = torch.load(str(ckpt_last), map_location="cpu")
@@ -478,15 +515,33 @@ if __name__ == "__main__":
             if scheduler is not None:
                 scheduler.step()
 
-            score = (m["auprc"] if not math.isnan(m["auprc"]) else m["acc"])
-            if score > best_score:
-                best_score  = score
-                best_epoch  = ep
-                best_metrics= dict(m)
-                best_thr    = float(thr_now)
-                torch.save({"epoch": ep, "state_dict": model.state_dict(),
-                            "metrics": m, "optimizer": optimizer.state_dict(),
-                            "scheduler": (scheduler.state_dict() if scheduler is not None else None)}, str(ckpt_best))
+            # score 用来监控是否改进（优先 AUPRC）
+            score = m["auprc"] if not math.isnan(m["auprc"]) else m["auroc"]
+
+
+            if score > best_score + args.es_min_delta:
+                best_score = score
+                best_state = copy.deepcopy(model.state_dict())
+                best_thr = float(thr_now)
+                best_metrics = dict(m)
+                best_epoch = ep
+                no_improve = 0
+                # 这里就顺手保存 best
+                torch.save({
+                    "epoch": ep,
+                    "state_dict": model.state_dict(),
+                    "metrics": m,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": (scheduler.state_dict() if scheduler is not None else None),
+                }, str(ckpt_best))
+            else:
+                no_improve += 1
+
+            # 触发早停
+            if args.early_stop and no_improve >= args.early_stop:
+                print(f"[EARLY-STOP] fold{t}: 连续 {args.early_stop} 个 epoch 无提升（best @ ep{best_epoch}）")
+                break
+
 
             # 保存 last.pth（每个 epoch 都覆盖）
             torch.save({

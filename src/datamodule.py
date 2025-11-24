@@ -301,10 +301,17 @@ class DataModule:
 
     # ----------- V1：向量模式 -----------
     def _collate_v1(self, b):
-        return (torch.stack([x[0] for x in b]),
-                torch.stack([x[1] for x in b]),
-                torch.stack([x[2] for x in b]),
-                torch.stack([torch.tensor(x[3], dtype=torch.float32) for x in b]))
+        return (
+            torch.stack([x[0] for x in b], dim=0),
+            torch.stack([x[1] for x in b], dim=0),
+            torch.stack([x[2] for x in b], dim=0),
+            # 这里不要再 torch.tensor(x[3]) 了
+            torch.stack([
+                (x[3].to(torch.float32) if torch.is_tensor(x[3])
+                 else torch.as_tensor(x[3], dtype=torch.float32))
+                for x in b
+            ], dim=0),
+        )
 
     # ----------- V2：序列模式 -----------
     def _collate_v2(self, b):
