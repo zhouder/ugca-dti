@@ -1,346 +1,355 @@
-# src/datamodule.py
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import hashlib, time, csv, random
+import hashlib
+import os
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
+from sklearn.model_selection import (
+    GroupKFold,
+    GroupShuffleSplit,
+    StratifiedKFold,
+    StratifiedShuffleSplit,
+)
 from torch.utils.data import Dataset, DataLoader
 
-# ---------------- configs ----------------
-@dataclass
-class DMConfig:
-    # 仅使用“内存数据”模式：直接传 (smiles, proteins, labels) 列表
-    train_data: Tuple[List[str], List[str], List[float]]
-    val_data:   Tuple[List[str], List[str], List[float]]
-    test_data:  Tuple[List[str], List[str], List[float]]
-    batch_size: int = 64
-    num_workers: int = 8
-    pin_memory: bool = True
-    persistent_workers: bool = True
-    prefetch_factor: int = 2
-    drop_last: bool = False
-    # 是否以“序列级（per-token）”模式工作
-    sequence: bool = False
 
-@dataclass
-class CacheDirs:
-    esm_dir: str        # 传任意一个（esm 或 esm2），内部会自动在二者间回退
-    molclr_dir: str
-    chemberta_dir: str
+def sha1_24(x: str) -> str:
+    return hashlib.sha1(x.encode("utf-8")).hexdigest()[:24]
 
-@dataclass
-class CacheDims:
-    esm2: int
-    molclr: int
-    chemberta: int
 
-# ---------------- utils ----------------
-def _sha1_24(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:24]
+class DTIDataset(Dataset):
+    """
+    单折数据集：返回离线特征 + label。
+    """
 
-def _index_npz_dir(dir_path: Path) -> Dict[str, Path]:
-    tbl: Dict[str, Path] = {}
-    if not dir_path.exists():
-        return tbl
-    for p in dir_path.rglob("*.npz"):
-        tbl[p.stem] = p
-    return tbl
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        indices: np.ndarray,
+        cache_root: str,
+        dataset_name: str,
+        mol_dir: str = "molclr",
+        esm_dir: str = "esm2",
+        chem_dir: str = "chemberta",
+        graph_dir: str = "gvp",
+    ):
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.indices = np.array(indices)
+        self.cache_root = cache_root
+        self.dataset_name = dataset_name
+        self.mol_dir = mol_dir
+        self.esm_dir = esm_dir
+        self.chem_dir = chem_dir
+        self.graph_dir = graph_dir
 
-def _npz_load_first_key(p: Optional[Path]) -> Optional[np.ndarray]:
-    if p is None or not p.exists():
-        return None
-    with np.load(str(p)) as z:
-        k = list(z.files)[0]
-        return z[k]
+    def __len__(self) -> int:
+        return len(self.indices)
 
-def _as_1d(x: Optional[np.ndarray], target_dim: int) -> np.ndarray:
-    # V1 路径：把 2D 平均到 1D
-    if x is None:
-        out = np.zeros((target_dim,), dtype=np.float32)
-    else:
-        try:
-            x = np.asarray(x)
-            if x.ndim == 2:
-                x = x.mean(axis=0)
-            x = np.asarray(x, dtype=np.float32)
-        except Exception:
-            return np.zeros((target_dim,), dtype=np.float32)
-        x = x.reshape(-1)
-        if x.shape[0] < target_dim:
-            pad = np.zeros((target_dim - x.shape[0],), dtype=np.float32)
-            out = np.concatenate([x, pad], axis=0)
-        else:
-            out = x[:target_dim]
-    if not out.flags["C_CONTIGUOUS"]:
-        out = np.ascontiguousarray(out, dtype=np.float32)
-    return out
+    def _load_array(self, subdir: str, key: str) -> np.ndarray:
+        """
+        尝试按以下顺序加载：
+        1) {key}.npz: 若是 NpzFile，优先取 'arr_0'，否则取第一个数组；
+        2) {key}.npy。
+        """
+        base = os.path.join(self.cache_root, subdir, self.dataset_name, key)
+        path_npz = base + ".npz"
+        path_npy = base + ".npy"
 
-def _as_2d(x: Optional[np.ndarray]) -> np.ndarray:
-    # V2 路径：尽量保留成 (T, D)；若 1D 则升维到 (1, D)
-    if x is None:
-        return np.zeros((0, 1), dtype=np.float32)
-    x = np.asarray(x)
-    if x.ndim == 1:
-        x = x[None, :]
-    x = np.asarray(x, dtype=np.float32, order="C")
-    return x
-
-def _to_tensor(x: np.ndarray) -> torch.Tensor:
-    try:
-        arr = np.array(x, dtype=np.float32, copy=True, order="C")
-    except Exception:
-        arr = np.zeros((1,), dtype=np.float32)
-    return torch.tensor(arr, dtype=torch.float32)
-
-def _read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[float]]:
-    """读取 all.csv（列：smiles,protein,label）"""
-    smiles, proteins, labels = [], [], []
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f, delimiter=",", quoting=csv.QUOTE_MINIMAL)
-        header = next(reader, None)
-
-        si = pi = li = None
-        if header:
-            heads = [c.strip().lower() for c in header]
-            if all(x in heads for x in ("smiles", "protein", "label")):
-                si, pi, li = heads.index("smiles"), heads.index("protein"), heads.index("label")
+        if os.path.exists(path_npz):
+            data = np.load(path_npz, allow_pickle=False)
+            # .npz: np.lib.npyio.NpzFile
+            if isinstance(data, np.lib.npyio.NpzFile):
+                if "arr_0" in data.files:
+                    arr = data["arr_0"]
+                else:
+                    # 取第一个数组
+                    arr = data[data.files[0]]
             else:
-                si, pi, li = 0, 1, 2
-                if len(header) >= 3:
-                    try:
-                        labels.append(float(header[2])); smiles.append(header[0]); proteins.append(header[1])
-                    except Exception:
-                        pass
-        else:
-            si, pi, li = 0, 1, 2
+                # 意外情况：np.save 保存但扩展名是 .npz
+                arr = data
+            return arr
 
-        for row in reader:
-            if not row or len(row) <= max(si, pi, li):
-                continue
-            s, p, l = row[si], row[pi], row[li]
-            try:
-                labels.append(float(l)); smiles.append(s); proteins.append(p)
-            except Exception:
-                continue
-    return smiles, proteins, labels
+        if os.path.exists(path_npy):
+            arr = np.load(path_npy, allow_pickle=False)
+            return arr
 
-_AMINO = set("ACDEFGHIKLMNPQRSTVWY")
-def _prot_variants(s: str) -> List[str]:
-    raw = s or ""
-    v = [raw, raw.strip(), "".join(raw.split()), "".join(raw.split()).upper()]
-    only_aa = "".join(ch for ch in raw if ch.upper() in _AMINO)
-    if only_aa:
-        v += [only_aa, only_aa.upper()]
-    out, seen = [], set()
-    for x in v:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
+        raise FileNotFoundError(f"Feature file not found for key={key} in {subdir}: "
+                                f"tried {path_npz} and {path_npy}")
 
-def _smiles_variants(s: str) -> List[str]:
-    raw = s or ""
-    v = [raw, raw.strip(), raw.replace(" ", ""), "".join(raw.split())]
-    out, seen = [], set()
-    for x in v:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
+    def __getitem__(self, idx: int) -> Dict:
+        row = self.df.iloc[self.indices[idx]]
+        smiles = str(row["smiles"])
+        protein = str(row["protein"])
+        label = float(row["label"])
 
-def _lookup(tbl: Dict[str, Path], keys: List[str]) -> Optional[Path]:
-    for k in keys:
-        key = _sha1_24(k)
-        p = tbl.get(key)
-        if p is not None:
-            return p
-    return None
+        did = sha1_24(smiles)
+        pid = sha1_24(protein)
 
-# ---------------- dataset：仅内存版 ----------------
-class DTIDatasetMem(Dataset):
-    """直接接收切片后的 (smiles, protein, label) 列表"""
-    def __init__(self,
-                 data: Tuple[List[str], List[str], List[float]],
-                 esm_tbl: Dict[str, Path],
-                 molclr_tbl: Dict[str, Path],
-                 chem_tbl: Dict[str, Path],
-                 dims: CacheDims,
-                 sequence: bool = False):
-        self.smiles, self.proteins, self.labels = data
-        self.esm_tbl = esm_tbl
-        self.molclr_tbl = molclr_tbl
-        self.chem_tbl = chem_tbl
-        self.dims = dims
-        self.sequence = sequence
-        self._cache_p, self._cache_d1, self._cache_d2 = {}, {}, {}
+        mol = self._load_array(self.mol_dir, did)  # (Ld, d_mol)
+        esm = self._load_array(self.esm_dir, pid)  # (Lp, d_prot)
+        chem = self._load_array(self.chem_dir, did)  # (d_chem,)
+        graph = self._load_array(self.graph_dir, pid)  # (d_graph,)
 
-    def __len__(self):
-        return len(self.labels)
+        sample = {
+            "drug_seq": mol.astype(np.float32),
+            "prot_seq": esm.astype(np.float32),
+            "chem": chem.astype(np.float32),
+            "graph": graph.astype(np.float32),
+            "label": label,  # ✅ 这里改成纯 float 就行了
+        }
+        return sample
 
-    def _vec_cached(self, p: Optional[Path], d: int, cache: dict) -> torch.Tensor:
-        if p is None:
-            return torch.zeros((d,), dtype=torch.float32)
-        k = str(p)
-        v = cache.get(k)
-        if v is None:
-            arr = _as_1d(_npz_load_first_key(Path(k)), d)
-            v = _to_tensor(arr)
-            cache[k] = v
-        return v
 
-    def _seq_cached(self, p: Optional[Path], cache: dict) -> np.ndarray:
-        if p is None:
-            return np.zeros((0, 1), dtype=np.float32)
-        k = str(p)
-        v = cache.get(k)
-        if v is None:
-            arr = _as_2d(_npz_load_first_key(Path(k)))
-            cache[k] = arr
-            v = arr
-        return v
+def dti_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+    """
+    将变长序列 pad 成批。
+    """
+    bs = len(batch)
+    drug_lens = [b["drug_seq"].shape[0] for b in batch]
+    prot_lens = [b["prot_seq"].shape[0] for b in batch]
+    max_ld = max(drug_lens)
+    max_lp = max(prot_lens)
 
-    def __getitem__(self, idx: int):
-        smi = self.smiles[idx]
-        pro = self.proteins[idx]
-        y   = float(self.labels[idx])
+    d_mol = batch[0]["drug_seq"].shape[1]
+    d_prot = batch[0]["prot_seq"].shape[1]
+    d_chem = batch[0]["chem"].shape[0]
+    d_graph = batch[0]["graph"].shape[0]
 
-        p_path  = _lookup(self.esm_tbl,   _prot_variants(pro))
-        d1_path = _lookup(self.molclr_tbl, _smiles_variants(smi))
-        d2_path = _lookup(self.chem_tbl,   _smiles_variants(smi))
+    drug_seq = torch.zeros(bs, max_ld, d_mol, dtype=torch.float32)
+    prot_seq = torch.zeros(bs, max_lp, d_prot, dtype=torch.float32)
+    drug_mask = torch.zeros(bs, max_ld, dtype=torch.long)
+    prot_mask = torch.zeros(bs, max_lp, dtype=torch.long)
+    chem = torch.zeros(bs, d_chem, dtype=torch.float32)
+    graph = torch.zeros(bs, d_graph, dtype=torch.float32)
+    labels = torch.zeros(bs, dtype=torch.float32)
 
-        if not self.sequence:
-            v_p  = self._vec_cached(p_path,  self.dims.esm2,      self._cache_p)
-            v_d1 = self._vec_cached(d1_path, self.dims.molclr,    self._cache_d1)
-            v_d2 = self._vec_cached(d2_path, self.dims.chemberta, self._cache_d2)
-            return v_p, v_d1, v_d2, torch.tensor(y, dtype=torch.float32)
-        else:
-            P  = self._seq_cached(p_path,  self._cache_p)
-            D1 = self._seq_cached(d1_path, self._cache_d1)
-            C  = self._seq_cached(d2_path, self._cache_d2)
-            if C.ndim == 2:
-                C = C.mean(axis=0)
-            return P, D1, C.astype(np.float32, copy=True), np.float32(y)
+    for i, b in enumerate(batch):
+        ld = b["drug_seq"].shape[0]
+        lp = b["prot_seq"].shape[0]
+        drug_seq[i, :ld] = torch.from_numpy(b["drug_seq"])
+        prot_seq[i, :lp] = torch.from_numpy(b["prot_seq"])
+        drug_mask[i, :ld] = 1
+        prot_mask[i, :lp] = 1
+        chem[i] = torch.from_numpy(b["chem"])
+        graph[i] = torch.from_numpy(b["graph"])
+        labels[i] = b["label"]
 
-# ---------------- collate helpers ----------------
-def _pad_and_mask(batch_list: List[np.ndarray]) -> Tuple[torch.Tensor, torch.Tensor]:
-    # 输入一批 (Ti, D)，输出 (B, T_max, D) 和 (B, T_max) bool-mask
-    lens = [x.shape[0] for x in batch_list]
-    d = max([x.shape[1] for x in batch_list] + [1])
-    tmax = max(lens + [1])
-    B = len(batch_list)
-    out = np.zeros((B, tmax, d), dtype=np.float32)
-    mask = np.zeros((B, tmax), dtype=bool)
-    for i, x in enumerate(batch_list):
-        L = x.shape[0]
-        out[i, :L, :x.shape[1]] = x
-        mask[i, :L] = True
-    return torch.tensor(out, dtype=torch.float32), torch.tensor(mask, dtype=torch.bool)
+    return {
+        "drug_seq": drug_seq,
+        "prot_seq": prot_seq,
+        "drug_mask": drug_mask,
+        "prot_mask": prot_mask,
+        "chem": chem,
+        "graph": graph,
+        "label": labels,
+    }
 
-# ---------------- datamodule ----------------
-class DataModule:
-    def __init__(self, cfg: DMConfig, cache_dirs: CacheDirs, dims: CacheDims):
-        self.cfg = cfg
-        self.dims = dims
 
-        # 兼容 esm / esm2 两种命名（自动回退）
-        cand = [Path(cache_dirs.esm_dir)]
-        if "/esm2/" in cache_dirs.esm_dir:
-            cand.append(Path(cache_dirs.esm_dir.replace("/esm2/", "/esm/")))
-        elif "/esm/" in cache_dirs.esm_dir:
-            cand.append(Path(cache_dirs.esm_dir.replace("/esm/", "/esm2/")))
-        picked = None
-        esm_tbl = {}
-        for c in cand:
-            tbl = _index_npz_dir(c)
-            if len(tbl) > 0:
-                picked, esm_tbl = c, tbl
-                break
-        if picked is None:
-            picked = cand[0]
-            esm_tbl = _index_npz_dir(picked)
+class DTIDataModule:
+    """
+    负责：
+      - 读取 all.csv
+      - 生成 5 折划分 (train/val/test)
+      - 返回各折 dataloader
 
-        self.esm_dir_used = str(picked)
-        self.esm_tbl = esm_tbl
-        self.molclr_tbl = _index_npz_dir(Path(cache_dirs.molclr_dir))
-        self.chem_tbl  = _index_npz_dir(Path(cache_dirs.chemberta_dir))
-        print(f"[CACHE] esm_dir_used={self.esm_dir_used}")
-        print(f"[CACHE] molclr_dir  ={cache_dirs.molclr_dir}")
-        print(f"[CACHE] chem_dir    ={cache_dirs.chemberta_dir}")
+    split_mode:
+      - 'cold-protein': 按 pid 做 5 折 group KFold
+      - 'cold-drug'   : 按 did 做 5 折 group KFold
+      - 'cold-both'   : 简化 double-cold（样本级 group，用于近似）
+      - 'warm' / 'random': 样本级 stratified KFold（药物和蛋白在各折之间是共享的）
+    """
 
-        t0 = time.time()
-        print(f"[PRELOAD] Index ESM={len(self.esm_tbl)} MolCLR={len(self.molclr_tbl)} ChemBERTa={len(self.chem_tbl)}   took {time.time()-t0:.1f}s")
+    def __init__(
+        self,
+        dataset_name: str,
+        data_root: str,
+        cache_root: str,
+        split_mode: str = "cold-protein",
+        n_splits: int = 5,
+        val_ratio: float = 0.15,
+        batch_size: int = 64,
+        num_workers: int = 4,
+        seed: int = 42,
+        pin_memory: bool = True,
+    ):
+        self.dataset_name = dataset_name
+        self.data_root = data_root
+        self.cache_root = cache_root
+        self.split_mode = split_mode
+        self.n_splits = n_splits
+        self.val_ratio = val_ratio
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.seed = seed
+        self.pin_memory = pin_memory
 
-        # 命中率报告
-        self._report_hit_rates_data(self.cfg.train_data, tag="train")
-        self._report_hit_rates_data(self.cfg.val_data,   tag="val")
-        self._report_hit_rates_data(self.cfg.test_data,  tag="test")
+        self.df: Optional[pd.DataFrame] = None
+        self.folds: List[Dict[str, np.ndarray]] = []
 
-    def _report_hit_rates_data(self, data: Tuple[List[str], List[str], List[float]], tag: str):
-        smi, pro, _ = data
-        n = len(smi)
-        if n == 0:
-            print(f"[HIT/{tag}] empty data")
+    @property
+    def csv_path(self) -> str:
+        return os.path.join(self.data_root, self.dataset_name, "all.csv")
+
+    def load_dataframe(self):
+        if self.df is not None:
             return
-        idxs = list(range(n))
-        if n > 2000:
-            random.seed(42); idxs = random.sample(idxs, 2000)
-        hit_p = hit_d1 = hit_d2 = hit_all = 0
-        for i in idxs:
-            p = _lookup(self.esm_tbl,   _prot_variants(pro[i]))
-            d1 = _lookup(self.molclr_tbl, _smiles_variants(smi[i]))
-            d2 = _lookup(self.chem_tbl,   _smiles_variants(smi[i]))
-            hp = p is not None
-            hd1 = d1 is not None
-            hd2 = d2 is not None
-            hit_p += hp; hit_d1 += hd1; hit_d2 += hd2; hit_all += (hp and hd1 and hd2)
-        total = len(idxs)
-        def pct(x): return f"{x/total*100:.1f}%"
-        print(f"[HIT/{tag}] sample={total} | ESM={pct(hit_p)} MolCLR={pct(hit_d1)} ChemBERTa={pct(hit_d2)} | ALL-3={pct(hit_all)}")
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"Dataset csv not found: {self.csv_path}")
+        df = pd.read_csv(self.csv_path)
+        if not {"smiles", "protein", "label"}.issubset(df.columns):
+            raise ValueError("all.csv must contain columns: smiles, protein, label")
 
-    # ----------- V1：向量模式 -----------
-    def _collate_v1(self, b):
-        return (
-            torch.stack([x[0] for x in b], dim=0),
-            torch.stack([x[1] for x in b], dim=0),
-            torch.stack([x[2] for x in b], dim=0),
-            # 这里不要再 torch.tensor(x[3]) 了
-            torch.stack([
-                (x[3].to(torch.float32) if torch.is_tensor(x[3])
-                 else torch.as_tensor(x[3], dtype=torch.float32))
-                for x in b
-            ], dim=0),
+        df["smiles"] = df["smiles"].astype(str)
+        df["protein"] = df["protein"].astype(str)
+        df["label"] = df["label"].astype(float)
+
+        df["did"] = df["smiles"].map(sha1_24)
+        df["pid"] = df["protein"].map(sha1_24)
+        self.df = df
+
+    def setup(self):
+        """
+        生成 n_splits 折划分：每折包含 train_idx, val_idx, test_idx。
+        """
+        self.load_dataframe()
+        df = self.df
+        labels = df["label"].values
+        pids = df["pid"].values
+        dids = df["did"].values
+        n = len(df)
+
+        split_mode = self.split_mode.lower()
+        folds: List[Dict[str, np.ndarray]] = []
+
+        if split_mode in ["cold-protein", "cold-drug", "cold-both"]:
+            if split_mode == "cold-protein":
+                groups = pids
+            elif split_mode == "cold-drug":
+                groups = dids
+            else:
+                # 简化 double-cold：每个样本为一组，等价随机 KFold
+                groups = np.arange(n)
+
+            gkf = GroupKFold(n_splits=self.n_splits)
+            outer = gkf.split(np.zeros(n), labels, groups)
+            for fold_idx, (trainval_idx, test_idx) in enumerate(outer):
+                trainval_idx = np.array(trainval_idx)
+                test_idx = np.array(test_idx)
+                groups_trainval = groups[trainval_idx]
+
+                gss = GroupShuffleSplit(
+                    n_splits=1,
+                    test_size=self.val_ratio,
+                    random_state=self.seed + fold_idx,
+                )
+                inner_train_idx_rel, val_idx_rel = next(
+                    gss.split(trainval_idx, labels[trainval_idx], groups_trainval)
+                )
+                train_idx = trainval_idx[inner_train_idx_rel]
+                val_idx = trainval_idx[val_idx_rel]
+
+                folds.append(
+                    {
+                        "train_idx": train_idx,
+                        "val_idx": val_idx,
+                        "test_idx": test_idx,
+                    }
+                )
+
+        elif split_mode in ["warm", "random"]:
+            skf = StratifiedKFold(
+                n_splits=self.n_splits, shuffle=True, random_state=self.seed
+            )
+            outer = skf.split(np.zeros(n), labels)
+            for fold_idx, (trainval_idx, test_idx) in enumerate(outer):
+                trainval_idx = np.array(trainval_idx)
+                test_idx = np.array(test_idx)
+
+                sss = StratifiedShuffleSplit(
+                    n_splits=1,
+                    test_size=self.val_ratio,
+                    random_state=self.seed + fold_idx,
+                )
+                inner_train_idx_rel, val_idx_rel = next(
+                    sss.split(trainval_idx, labels[trainval_idx])
+                )
+                train_idx = trainval_idx[inner_train_idx_rel]
+                val_idx = trainval_idx[val_idx_rel]
+
+                folds.append(
+                    {
+                        "train_idx": train_idx,
+                        "val_idx": val_idx,
+                        "test_idx": test_idx,
+                    }
+                )
+        else:
+            raise ValueError(f"Unknown split_mode: {self.split_mode}")
+
+        self.folds = folds
+
+    def get_fold_indices(self, fold: int) -> Dict[str, np.ndarray]:
+        if not self.folds:
+            self.setup()
+        if fold < 0 or fold >= len(self.folds):
+            raise IndexError(f"Fold index {fold} out of range")
+        return self.folds[fold]
+
+    def make_dataloader(
+        self,
+        indices: np.ndarray,
+        shuffle: bool,
+    ) -> DataLoader:
+        dataset = DTIDataset(
+            df=self.df,
+            indices=indices,
+            cache_root=self.cache_root,
+            dataset_name=self.dataset_name,
         )
-
-    # ----------- V2：序列模式 -----------
-    def _collate_v2(self, b):
-        # b[i] = (P:(Mi,dp), D1:(Ni,dd), C:(dc,), y)
-        P_list  = [x[0] for x in b]
-        D_list  = [x[1] for x in b]
-        C_list  = [x[2] for x in b]
-        y_list  = [x[3] for x in b]
-        P, Pm = _pad_and_mask(P_list)  # (B,Mmax,dp), (B,Mmax)
-        D, Dm = _pad_and_mask(D_list)  # (B,Nmax,dd), (B,Nmax)
-        C = torch.tensor(np.stack(C_list, axis=0), dtype=torch.float32)  # (B,dc)
-        y = torch.tensor(np.asarray(y_list, dtype=np.float32), dtype=torch.float32)
-        return P, Pm, D, Dm, C, y
-
-    def _make_loader(self, data, shuffle: bool) -> DataLoader:
-        ds = DTIDatasetMem(data, self.esm_tbl, self.molclr_tbl, self.chem_tbl, self.dims, sequence=self.cfg.sequence)
-        cf = self._collate_v1 if not self.cfg.sequence else self._collate_v2
-        return DataLoader(
-            ds, batch_size=self.cfg.batch_size, shuffle=shuffle, num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory, persistent_workers=self.cfg.persistent_workers,
-            prefetch_factor=self.cfg.prefetch_factor, drop_last=self.cfg.drop_last if shuffle else False,
-            collate_fn=cf
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=dti_collate_fn,
         )
+        return loader
 
-    def train_loader(self) -> DataLoader:
-        return self._make_loader(self.cfg.train_data, shuffle=True)
+    def get_dataloaders(self, fold: int) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        indices = self.get_fold_indices(fold)
+        train_loader = self.make_dataloader(indices["train_idx"], shuffle=True)
+        val_loader = self.make_dataloader(indices["val_idx"], shuffle=False)
+        test_loader = self.make_dataloader(indices["test_idx"], shuffle=False)
+        return train_loader, val_loader, test_loader
 
-    def val_loader(self) -> DataLoader:
-        return self._make_loader(self.cfg.val_data, shuffle=False)
 
-    def test_loader(self) -> DataLoader:
-        return self._make_loader(self.cfg.test_data, shuffle=False)
+def check_datasets_hit(dataset_name: str, data_root: str, cache_root: str):
+    """
+    在开始训练时只检查当前数据集：
+      - all.csv 是否存在
+      - 四种特征目录是否存在，以及其中的特征文件数量（.npy/.npz）
+    """
+    feat_dirs = ["esm2", "molclr", "chemberta", "gvp"]
+
+    csv_path = os.path.join(data_root, dataset_name, "all.csv")
+    csv_ok = os.path.exists(csv_path)
+
+    print("==== Dataset & Cache Check ====")
+    if csv_ok:
+        print(f"[{dataset_name}] csv: HIT -> {csv_path}")
+    else:
+        print(f"[{dataset_name}] csv: MISS -> {csv_path}")
+
+    for fd in feat_dirs:
+        d = os.path.join(cache_root, fd, dataset_name)
+        if os.path.isdir(d):
+            n_files = len(
+                [f for f in os.listdir(d) if f.endswith(".npy") or f.endswith(".npz")]
+            )
+            print(f"  {fd}: HIT  | files={n_files} | dir={d}")
+        else:
+            print(f"  {fd}: MISS | dir={d}")
+    print("================================")

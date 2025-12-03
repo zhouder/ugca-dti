@@ -1,585 +1,627 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-import os, time, math, argparse, importlib, inspect, csv, copy
-from pathlib import Path
-from typing import Dict, List, Tuple
+import argparse
+import os
+import random
+import time
+from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 import torch
-from torch import nn, optim
+import torch.nn.functional as F
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    accuracy_score,
+    confusion_matrix,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+)
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-from src.datamodule import DataModule, DMConfig, CacheDirs, CacheDims, _read_smiles_protein_label
+from src.datamodule import DTIDataModule, check_datasets_hit
+from src.model import UGCADTIModel
 
-# ===== sklearn =====
-try:
-    from sklearn.metrics import (
-        roc_auc_score, average_precision_score, f1_score,
-        accuracy_score, recall_score, matthews_corrcoef
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_model(args) -> UGCADTIModel:
+    model = UGCADTIModel(
+        d_mol=args.d_mol,
+        d_prot=args.d_prot,
+        d_chem=args.d_chem,
+        d_graph=args.d_graph,
+        d_model=args.d_model,
+        d_fuse=args.d_fuse,
+        nlayers=args.nlayers,
+        nhead=args.nhead,
+        dim_feedforward=args.dim_feedforward,
+        dropout=args.dropout,
+        pool_type=args.pooling,
+        fusion_head=args.fusion_head,
+        gate_mode=args.gate_mode,
+        gate_lambda=args.gate_lambda,
+        gate_min=args.g_min,
+        attn_temp=args.attn_temp,
+        pool_heads=args.pool_heads,
+        mutan_rank=args.mutan_rank,
     )
-    from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, StratifiedShuffleSplit
-    from src.splits import make_outer_splits, sample_val_indices
-    SKLEARN = True
-except Exception:
-    SKLEARN = False
-    print("[WARN] scikit-learn 不可用，将退化到少量指标。")
+    return model
 
-# ---------- metrics ----------
-def compute_metrics(prob: np.ndarray, y_true: np.ndarray, thr: float = 0.5) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    if SKLEARN:
-        pred = (prob >= thr).astype(np.int64)
-        out["acc"] = float(accuracy_score(y_true, pred))
-        out["sen"] = float(recall_score(y_true, pred))
-        out["f1"]  = float(f1_score(y_true, pred))
-        out["mcc"] = float(matthews_corrcoef(y_true, pred))
-        try:    out["auroc"] = float(roc_auc_score(y_true, prob))
-        except Exception: out["auroc"] = float("nan")
-        try:    out["auprc"] = float(average_precision_score(y_true, prob))
-        except Exception: out["auprc"] = float("nan")
+
+def build_optimizer(model: torch.nn.Module, args):
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    return optimizer
+
+
+def build_scheduler(optimizer, args):
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.cosine_t0, T_mult=args.cosine_tmult
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=3
+        )
+    elif args.lr_scheduler == "none":
+        scheduler = None
     else:
-        pred = (prob >= thr).astype(np.int64)
-        out["acc"] = float((pred == y_true).mean())
-        out["sen"] = float((pred[y_true == 1] == 1).mean() if (y_true == 1).any() else 0.0)
-        out["f1"]  = float("nan")
-        out["mcc"] = float("nan")
-        out["auroc"] = float("nan")
-        out["auprc"] = float("nan")
-    return out
+        raise ValueError(f"Unknown lr_scheduler: {args.lr_scheduler}")
+    return scheduler
 
-def fmt1(m: Dict[str, float]) -> str:
-    return (f"AUROC {m['auroc']:>7.4f} | AUPRC {m['auprc']:>7.4f} | "
-            f"F1 {m['f1']:>7.4f} | ACC {m['acc']:>7.4f} | "
-            f"SEN {m['sen']:>7.4f} | MCC {m['mcc']:>7.4f}")
 
-def find_best_threshold(prob: np.ndarray, y_true: np.ndarray, grid: np.ndarray | None = None) -> float:
-    """在验证集上搜索使 F1 最大的阈值"""
-    if grid is None:
-        uniq = np.unique(np.clip(prob, 0.0, 1.0))
-        grid = uniq if uniq.size <= 500 else np.linspace(0.01, 0.99, 200)
-    best_t, best_f1 = 0.5, -1.0
-    for t in grid:
-        pred = (prob >= t).astype(np.int64)
+def build_criterion(args):
+    if args.loss == "bce":
+        return torch.nn.BCEWithLogitsLoss()
+    elif args.loss == "wbce":
+        # 使用 pos_weight，简单按正负比例计算
+        pos_weight = torch.tensor([args.pos_weight], dtype=torch.float32)
+        return torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    elif args.loss == "focal":
+        # focal 在下面手动实现
+        return None
+    else:
+        raise ValueError(f"Unknown loss: {args.loss}")
+
+
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """
+    logits: (B,)
+    targets: (B,)
+    """
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    probs = torch.sigmoid(logits)
+    pt = probs * targets + (1 - probs) * (1 - targets)
+    loss = alpha * (1 - pt) ** gamma * bce
+    return loss.mean()
+
+
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    y_true = y_true.astype(int)
+    y_prob = y_prob.astype(float)
+    y_pred = (y_prob >= threshold).astype(int)
+
+    metrics = {}
+    if len(np.unique(y_true)) == 2:
         try:
-            f1 = f1_score(y_true, pred) if SKLEARN else float("nan")
+            metrics["AUROC"] = roc_auc_score(y_true, y_prob)
         except Exception:
-            f1 = float("nan")
-        if not np.isnan(f1) and f1 > best_f1:
-            best_f1, best_t = float(f1), float(t)
-    return float(best_t)
-
-# ---------- model loader ----------
-def build_model_from_src(dims: CacheDims, args) -> nn.Module:
-    model_mod = importlib.import_module("src.model")
-    if hasattr(model_mod, "build_model"):
-        print("[Model] 使用 src.model.build_model(cfg)")
-        cfg = {
-            "d_protein": int(dims.esm2),
-            "d_molclr":  int(dims.molclr),
-            "d_chem":    int(dims.chemberta),
-            "d_model":   512, "dropout": 0.1, "act": "silu",
-            "sequence": bool(args.sequence),
-            # seq-only
-            "nhead": 4, "nlayers": 2,
-            "fusion": args.fusion,
-            "mutan_rank": args.mutan_rank,
-            "mutan_dim": args.mutan_dim,
-            "head_hidden": 512,
-            # gate
-            "gate_type": args.gate_type,
-            "gate_mode": args.gate_mode,
-            "gate_lambda": args.gate_lambda,
-            "g_min": args.g_min,
-            "smooth_g": args.smooth_g,
-            "topk_ratio": args.topk_ratio,
-            # cross-attn
-            "attn_temp": getattr(args, "attn_temp", 1.0),
-            # pooling
-            "pool_type": args.pool_type,
-            # drug fuse
-            "drug_fuse": args.drug_fuse,
-            "strict_concat_ln": args.strict_concat_ln,
-            "chem_dim": int(dims.chemberta),
-            # regularization
-            "entropy_reg": args.entropy_reg,
-        }
-        return getattr(model_mod, "build_model")(cfg)
-
-    # 回退：按类名查找
-    cand_names = [args.model_class] if args.model_class else []
-    cand_names += ["UGCASeqModel" if args.sequence else "UGCAModel", "UGCA", "Model"]
-    for name in cand_names:
-        if not name: continue
-        c = getattr(model_mod, name, None)
-        if inspect.isclass(c) and issubclass(c, nn.Module):
-            print(f"[Model] 使用类 {name}")
-            try:
-                return c({"d_protein": dims.esm2, "d_molclr": dims.molclr, "d_chem": dims.chemberta})
-            except TypeError:
-                try: return c(dims)
-                except Exception: return c({"d_protein": dims.esm2, "d_molclr": dims.molclr, "d_chem": dims.chemberta})
-    raise RuntimeError("在 src/model.py 中没找到可用的模型类。")
-
-# ---------- train / eval ----------
-def _batch_to_device(batch, device: torch.device):
-    if isinstance(batch, (list, tuple)):
-        return tuple(x.to(device) if torch.is_tensor(x) else x for x in batch)
-    return batch.to(device) if torch.is_tensor(batch) else batch
-
-def _forward_any(model: nn.Module, batch):
-    # V1: (Dp, Dd1, Dc, y)       → logits, y
-    # V2: (P, Pm, D, Dm, C, y)   → logits, y
-    if len(batch) == 4:
-        Dp, Dd1, Dc, y = batch
-        logits = model(Dp, Dd1, Dc)
-        return logits, y
+            metrics["AUROC"] = np.nan
+        try:
+            metrics["AUPRC"] = average_precision_score(y_true, y_prob)
+        except Exception:
+            metrics["AUPRC"] = np.nan
     else:
-        P, Pm, D, Dm, C, y = batch
-        logits = model(P, Pm, D, Dm, C)
-        return logits, y
+        metrics["AUROC"] = np.nan
+        metrics["AUPRC"] = np.nan
 
-def train_epoch(model: nn.Module, loader: DataLoader, device: torch.device, optimizer: optim.Optimizer,
-                tag: str, ep: int, ep_total: int, gate_budget: float = 0.0, gate_rho: float = 0.6,
-                amp_mode: str = "off", scaler=None, amp_dtype=None) -> Tuple[float, float]:
-    model.train(True)
-    bce = nn.BCEWithLogitsLoss()
-    tot = 0.0
-    t0 = time.time()
-    n_seen = 0
-    total_samples = len(loader.dataset)
-    pbar = tqdm(total=total_samples, ncols=120, unit="ex",
-                desc=f"[{tag}] epoch {ep}/{ep_total}", leave=True, position=0)
+    metrics["F1"] = f1_score(y_true, y_pred, zero_division=0)
+    metrics["Accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["Precision"] = precision_score(y_true, y_pred, zero_division=0)
+    metrics["Sensitivity"] = recall_score(y_true, y_pred, zero_division=0)  # recall
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp + 1e-8)
+    metrics["Specificity"] = specificity
+    try:
+        metrics["MCC"] = matthews_corrcoef(y_true, y_pred)
+    except Exception:
+        metrics["MCC"] = 0.0
 
-    for batch in loader:
-        batch = _batch_to_device(batch, device)
+    return metrics
 
-        # --- forward ---
-        use_amp = amp_mode != "off"
+def find_best_f1_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    num_thresholds: int = 101,
+):
+    """
+    在 [0,1] 上均匀扫阈值，找到 F1 最高的阈值。
+    返回 (best_thr, best_f1)。
+    """
+    y_true = y_true.astype(int)
+    y_prob = y_prob.astype(float)
+
+    best_thr = 0.5
+    best_f1 = -1.0
+    thresholds = np.linspace(0.0, 1.0, num_thresholds)
+
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(int)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = t
+
+    return float(best_thr), float(best_f1)
+
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    criterion,
+    args,
+    scaler: torch.cuda.amp.GradScaler,
+) -> (float, np.ndarray, np.ndarray):
+    model.train()
+    all_losses: List[float] = []
+    all_probs: List[np.ndarray] = []
+    all_labels: List[np.ndarray] = []
+
+    pbar = tqdm(loader, desc="Train", leave=False)
+    for batch in pbar:
+        drug_seq = batch["drug_seq"].to(device)
+        prot_seq = batch["prot_seq"].to(device)
+        drug_mask = batch["drug_mask"].to(device)
+        prot_mask = batch["prot_mask"].to(device)
+        chem = batch["chem"].to(device)
+        graph = batch["graph"].to(device)
+        labels = batch["label"].to(device)
+
         optimizer.zero_grad(set_to_none=True)
 
-        if use_amp:
-            with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
-                                dtype=amp_dtype, enabled=True):
-                logits, y = _forward_any(model, batch)
-                loss = bce(logits, y)
-                # 门控预算正则
-                if gate_budget > 0.0 and hasattr(model, "last_gates"):
-                    gd, gp = model.last_gates()
-                    if gd is not None and gp is not None:
-                        def _mean1d(g): return g.mean(dim=1).mean()
-                        Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
-                        loss = loss + gate_budget * Lb
-        else:
-            logits, y = _forward_any(model, batch)
-            loss = bce(logits, y)
-            if gate_budget > 0.0 and hasattr(model, "last_gates"):
-                gd, gp = model.last_gates()
-                if gd is not None and gp is not None:
-                    def _mean1d(g): return g.mean(dim=1).mean()
-                    Lb = ((_mean1d(gd) - gate_rho) ** 2 + (_mean1d(gp) - gate_rho) ** 2) * 0.5
-                    loss = loss + gate_budget * Lb
+        with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
+            logits = model(drug_seq, prot_seq, chem, graph, drug_mask, prot_mask)
+            labels_float = labels
+            if args.loss == "focal":
+                loss = focal_loss(logits, labels_float, alpha=args.focal_alpha, gamma=args.focal_gamma)
+            else:
+                if args.loss == "wbce":
+                    # pos_weight 已在 CPU 上，移动到设备
+                    criterion.pos_weight = criterion.pos_weight.to(device)
+                loss = criterion(logits, labels_float)
 
-        # --- backward ---
-        if amp_mode == "fp16":
-            assert scaler is not None
+        if scaler is not None and args.amp and device.type == "cuda":
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
 
-        # --- logging ---
-        bs = y.size(0)
-        tot += float(loss.detach().cpu())
-        n_seen += bs
-        pbar.update(bs)
-        if n_seen and (n_seen % (bs * 10) == 0 or n_seen == total_samples):
-            pbar.set_postfix_str(f"{n_seen}/{total_samples} ex | loss {tot * 1.0 / (n_seen / bs):.4f}")
+        all_losses.append(loss.item())
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        all_probs.append(probs)
+        all_labels.append(labels.detach().cpu().numpy())
 
-    pbar.close()
-    return tot / max(1, n_seen / bs), time.time() - t0
+        pbar.set_postfix(loss=loss.item())
+
+    avg_loss = float(np.mean(all_losses))
+    all_probs_arr = np.concatenate(all_probs, axis=0)
+    all_labels_arr = np.concatenate(all_labels, axis=0)
+    return avg_loss, all_probs_arr, all_labels_arr
+
 
 @torch.no_grad()
-def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
-               amp_mode: str = "off", amp_dtype=None) -> Tuple[float, np.ndarray, np.ndarray, float]:
-    model.train(False)
-    bce = nn.BCEWithLogitsLoss()
-    tot = 0.0
-    probs, labels = [], []
-    t0 = time.time()
+def evaluate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    criterion,
+    args,
+) -> (float, np.ndarray, np.ndarray):
+    model.eval()
+    all_losses: List[float] = []
+    all_probs: List[np.ndarray] = []
+    all_labels: List[np.ndarray] = []
 
-    use_amp = amp_mode != "off"
     for batch in loader:
-        batch = _batch_to_device(batch, device)
-        if use_amp:
-            with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
-                                dtype=amp_dtype, enabled=True):
-                logits, y = _forward_any(model, batch)
-                loss = bce(logits, y)
+        drug_seq = batch["drug_seq"].to(device)
+        prot_seq = batch["prot_seq"].to(device)
+        drug_mask = batch["drug_mask"].to(device)
+        prot_mask = batch["prot_mask"].to(device)
+        chem = batch["chem"].to(device)
+        graph = batch["graph"].to(device)
+        labels = batch["label"].to(device)
+
+        logits = model(drug_seq, prot_seq, chem, graph, drug_mask, prot_mask)
+        labels_float = labels
+        if args.loss == "focal":
+            loss = focal_loss(logits, labels_float, alpha=args.focal_alpha, gamma=args.focal_gamma)
         else:
-            logits, y = _forward_any(model, batch)
-            loss = bce(logits, y)
+            if args.loss == "wbce":
+                criterion.pos_weight = criterion.pos_weight.to(device)
+            loss = criterion(logits, labels_float)
 
-        tot += float(loss.detach().cpu())
-        probs.append(torch.sigmoid(logits.float()).detach().cpu().numpy())
-        labels.append(y.detach().cpu().numpy())
+        all_losses.append(loss.item())
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        all_probs.append(probs)
+        all_labels.append(labels.detach().cpu().numpy())
 
-    prob = np.concatenate(probs, axis=0) if probs else np.zeros((0,), dtype=np.float32)
-    lab  = np.concatenate(labels, axis=0) if labels else np.zeros((0,), dtype=np.float32)
-    return tot / max(1, len(loader)), prob, lab, time.time() - t0
+    avg_loss = float(np.mean(all_losses) if all_losses else 0.0)
+    all_probs_arr = np.concatenate(all_probs, axis=0) if all_probs else np.array([])
+    all_labels_arr = np.concatenate(all_labels, axis=0) if all_labels else np.array([])
+    return avg_loss, all_probs_arr, all_labels_arr
 
-# ---------- CLI ----------
+
+def save_checkpoint(
+    path: str,
+    model: torch.nn.Module,
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_val_auprc: float,
+):
+    ckpt = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "epoch": epoch,
+        "best_val_auprc": best_val_auprc,
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(
+    path: str,
+    model: torch.nn.Module,
+    optimizer,
+    scheduler,
+    device: torch.device,
+):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    if scheduler is not None and ckpt.get("scheduler_state") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+    epoch = ckpt.get("epoch", 0)
+    best_val_auprc = ckpt.get("best_val_auprc", -1e9)
+    return epoch, best_val_auprc
+
+
+def log_epoch_to_csv(
+    log_path: str,
+    epoch: int,
+    phase: str,
+    metrics: Dict[str, float],
+    loss: float,
+    lr: float,
+):
+    row = {"epoch": epoch, "phase": phase, "loss": loss, "lr": lr}
+    row.update(metrics)
+
+    file_exists = os.path.exists(log_path)
+    df = pd.DataFrame([row])
+    if file_exists:
+        df.to_csv(log_path, mode="a", header=False, index=False)
+    else:
+        df.to_csv(log_path, mode="w", header=True, index=False)
+
+
+def save_result_csv(result_path: str, metrics: Dict[str, float]):
+    df = pd.DataFrame([metrics])
+    df.to_csv(result_path, index=False)
+
+
+def save_summary_csv(summary_path: str, fold_metrics: List[Dict[str, float]]):
+    if not fold_metrics:
+        return
+    df = pd.DataFrame(fold_metrics)
+    metrics_cols = [c for c in df.columns if c != "fold"]
+
+    mean_row = {"fold": "mean"}
+    std_row = {"fold": "std"}
+    for m in metrics_cols:
+        mean_row[m] = df[m].mean()
+        std_row[m] = df[m].std(ddof=0)
+
+    summary_df = pd.concat([df, pd.DataFrame([mean_row, std_row])], ignore_index=True)
+    summary_df.to_csv(summary_path, index=False)
+
+
 def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True, help="如 DAVIS / BindingDB / BioSNAP（大小写不敏感）")
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--model-class", default="", help="通常不用；除非你显式选类（如 UGCASeqModel）")
-    ap.add_argument("--seed", type=int, default=42)
+    parser = argparse.ArgumentParser(description="UGCA-DTI v1.0 Training Script")
 
-    # 模型形态与门控/融合/池化
-    ap.add_argument("--sequence", action="store_true", help="启用 per-token（序列级）模式")
-    ap.add_argument("--fusion", type=str, default="mutan", choices=["mutan","concat","block","mcb"])
-    ap.add_argument("--mutan-rank", type=int, default=10)
-    ap.add_argument("--mutan-dim", type=int, default=512)
-    ap.add_argument("--pool-type", type=str, default="attn", choices=["attn","mean"])
-    ap.add_argument("--attn_temp", type=float, default=0.8,
-                    help="Cross-attention 的温度缩放系数，默认 1.0")
+    # 数据 & 路径
+    parser.add_argument("--dataset", type=str, default="DAVIS", help="DAVIS / BindingDB / BioSNAP")
+    parser.add_argument("--data-root", type=str, default="/root/lanyun-tmp")
+    parser.add_argument("--cache-root", type=str, default="/root/lanyun-tmp/cache")
+    parser.add_argument("--output-dir", type=str, default="/root/lanyun-tmp/ugca-runs")
+    parser.add_argument("--split-mode", type=str, default="cold-protein")
 
-    ap.add_argument("--gate-type", type=str, default="evidential", choices=["evidential","mlp"])
-    ap.add_argument("--gate-mode", type=str, default="evi_only", choices=["mu_times_evi","evi_only","mu_only"])
-    ap.add_argument("--gate-lambda", type=float, default=1.0)
-    ap.add_argument("--g-min", type=float, default=0.05)
-    ap.add_argument("--smooth-g", action="store_true")
-    ap.add_argument("--topk-ratio", type=float, default=0.0)
-    ap.add_argument("--entropy-reg", type=float, default=0.0)
+    # 特征维度
+    parser.add_argument("--d-mol", type=int, default=300)
+    parser.add_argument("--d-prot", type=int, default=1280)
+    parser.add_argument("--d-chem", type=int, default=384)
+    parser.add_argument("--d-graph", type=int, default=256)
 
-    ap.add_argument("--drug-fuse", type=str, default="pool_concat", choices=["pool_concat","inject"],
-                    help="序列模型：先池化再 concat+LN（pool_concat），或把 chem 注入 token（inject）")
-    ap.add_argument("--strict-concat-ln", action="store_true", help="启用 concat 后的 LayerNorm（严格对齐）")
+    # 模型结构
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--d-fuse", type=int, default=512)
+    parser.add_argument("--nlayers", type=int, default=2)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--dim-feedforward", type=int, default=512)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--pooling", type=str, default="meanmax")
+    parser.add_argument("--pool-heads", type=int, default=4)
+    parser.add_argument("--fusion-head", type=str, default="match-mlp")
+    parser.add_argument("--gate-mode", type=str, default="mu_times_evi")
+    parser.add_argument("--gate-lambda", type=float, default=1.0)
+    parser.add_argument("--g-min", type=float, default=1e-3)
+    parser.add_argument("--attn-temp", type=float, default=1.0)
+    parser.add_argument("--mutan-rank", type=int, default=8)
 
-    # AMP
-    ap.add_argument("--amp", type=str, choices=["off","fp16","bf16"], default="bf16")
+    # 训练设置
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--patience", type=int, default=15)
 
-    # 冷启动设置：默认 5 折；整体比例默认 0.7/0.1/0.2
-    ap.add_argument("--split-mode",
-                    choices=["warm", "hot", "cold-protein", "cold-drug", "cold-both", "cold-pair"],
-                    default="cold-protein")
+    # 优化器 & 学习率
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["cosine", "plateau", "none"])
+    parser.add_argument("--cosine-t0", type=int, default=10)
+    parser.add_argument("--cosine-tmult", type=int, default=2)
 
-    ap.add_argument("--cv-folds", type=int, default=5)
-    ap.add_argument("--overall-train", type=float, default=0.7)
-    ap.add_argument("--overall-val",   type=float, default=0.1)
-    ap.add_argument("--thr", default="auto",
-                    help="决策阈值；'auto'=在验证集上选择使F1最大的阈值；或显式给出如 0.35")
+    # 损失函数
+    parser.add_argument("--loss", type=str, default="focal", choices=["bce", "wbce", "focal"])
+    parser.add_argument("--pos-weight", type=float, default=1.0)  # 给 WBCE 用
+    parser.add_argument("--focal-alpha", type=float, default=0.25)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
 
-    # 门控预算正则（缺省为关闭）
-    ap.add_argument("--gate-budget", dest="gate_budget", type=float, default=1e-3,
-                    help="证据门控的预算正则系数，0 表示关闭")
-    ap.add_argument("--gate-rho", dest="gate_rho", type=float, default=0.6,
-                    help="门控期望开启比例 ρ，用于预算正则的目标")
+    args = parser.parse_args()
+    return args
 
-    # 输出与断点续训
-    ap.add_argument("--out-dir", default="",
-                    help="可选：自定义输出根目录；不设则默认 /root/lanyun-tmp/ugca-runs/<DATASET>-cold-{protein|drug}[-seq][-suffix]")
-    ap.add_argument("--suffix", default="", help="可选：给目录添加自定义后缀，如 '-seq'、'-s42'")
-    ap.add_argument("--resume", action="store_true", help="断点续训：已完成的折自动跳过；存在 last.pth 时从其 epoch+1 继续")
 
-    # ===== 新增：Step Decay 学习率调度 =====
-    ap.add_argument("--lr-sched", type=str, choices=["off","step"], default="off",
-                    help="学习率调度器：off=恒定学习率；step=StepLR（按 epoch 阶梯衰减）")
-    ap.add_argument("--step-size", type=int, default=20,
-                    help="StepLR 的 step_size（每隔多少个 epoch 衰减一次）")
-    ap.add_argument("--gamma", type=float, default=0.1,
-                    help="StepLR 的 gamma（每次衰减倍率，0.1 表示学习率*0.1）")
-    ap.add_argument("--early-stop", type=int, default=15, help="patience；0 表示关闭")
-    ap.add_argument("--es-min-delta", type=float, default=0.0, help="最小提升幅度，超过才算改进")
-
-    return ap.parse_args()
-
-# ---------- helpers for split ----------
-def sample_val_from_pool_by_groups(pool_idx: np.ndarray, groups: np.ndarray,
-                                   val_frac_in_pool: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    """在候选训练池(不含test)里，按 group 采样一部分作为 val（组不交叠）"""
-    pool_groups = groups[pool_idx]
-    uniq = np.unique(pool_groups)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(uniq)
-    n_val_groups = max(1, int(round(val_frac_in_pool * len(uniq))))
-    val_set = set(uniq[:n_val_groups])
-    mask = np.array([g in val_set for g in pool_groups], dtype=bool)
-    va_idx = pool_idx[mask]
-    tr_idx = pool_idx[~mask]
-    return tr_idx, va_idx
-
-# ---------- main ----------
-if __name__ == "__main__":
+def main():
     args = parse_args()
-    print(f"[ENV] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}")
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-    print(f"device: {'cuda' if use_cuda else 'cpu'} | cuda_available: {use_cuda}")
-    if use_cuda:
-        try: print("gpu:", torch.cuda.get_device_name(0))
-        except Exception: pass
+    set_seed(args.seed)
 
-    # AMP 设置
-    amp_mode = args.amp
-    amp_dtype = torch.float16 if amp_mode == "fp16" else (torch.bfloat16 if amp_mode == "bf16" else None)
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp_mode == "fp16"))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- 自动路径 ----
-    ds_lower = args.dataset.lower()
-    ds_cap   = {"bindingdb":"BindingDB", "davis":"DAVIS", "biosnap":"BioSNAP"}.get(ds_lower, args.dataset)
-    data_root = Path("/root/lanyun-tmp")
-    all_csv   = data_root / ds_cap / "all.csv"
-    if not all_csv.exists():
-        raise FileNotFoundError(f"未找到 {all_csv}，请确认你已把 all.csv 放到该路径。")
+    check_datasets_hit(args.dataset, args.data_root, args.cache_root)
 
-    cache_root = data_root / "cache"
-    cache_dirs = CacheDirs(
-        esm_dir      = str(cache_root / "esm2"     / ds_cap),   # 自动在 esm2/esm 间回退
-        molclr_dir   = str(cache_root / "molclr"   / ds_cap),
-        chemberta_dir= str(cache_root / "chemberta"/ ds_cap),
+    # 数据模块（生成 5 折）
+    datamodule = DTIDataModule(
+        dataset_name=args.dataset,
+        data_root=args.data_root,
+        cache_root=args.cache_root,
+        split_mode=args.split_mode,
+        n_splits=5,
+        val_ratio=0.15,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        pin_memory=(device.type == "cuda"),
     )
-    dims = CacheDims(esm2=1280, molclr=300, chemberta=384)
+    datamodule.setup()
 
-    # ---- 读 all.csv ----
-    smiles, proteins, labels = _read_smiles_protein_label(str(all_csv))
-    N = len(labels)
-    print(f"[ALL] loaded: {N} rows from {all_csv}")
+    run_dir = os.path.join(args.output_dir, f"{args.dataset}_{args.split_mode}")
+    os.makedirs(run_dir, exist_ok=True)
 
-    # ---- 构建外层K折，用于 test ----
-    prot_key = np.asarray(proteins)
-    drug_key = np.asarray(smiles)
-    split_mode = "warm" if args.split_mode == "hot" else args.split_mode
+    fold_results: List[Dict[str, float]] = []
 
-    outer_splits = make_outer_splits(
-        split_mode,
-        args.cv_folds if args.cv_folds > 1 else 5,
-        args.seed,
-        drug_key, prot_key, np.asarray(labels)
-    )
-    overall_test = 1.0 / len(outer_splits)
-    val_frac_in_pool = args.overall_val / (1.0 - overall_test)  # 0.1 / 0.8 = 0.125
-    print(
-        f"[SPLIT] 模式={split_mode} | 折数={len(outer_splits)} | 目标总体比例 train:val:test = {args.overall_train}:{args.overall_val}:{overall_test:.1f}")
-    print("[SPLIT] 实施策略：每折 test=1/K；在其余 (1-1/K) 的候选池按模式抽取 val，其余做 train；冷模式均按组不交叠")
+    for fold in range(5):
+        fold_id = fold + 1
+        print(f"\n========== Fold {fold_id} / 5 ==========")
+        fold_dir = os.path.join(run_dir, f"fold_{fold_id}")
+        os.makedirs(fold_dir, exist_ok=True)
+        best_ckpt_path = os.path.join(fold_dir, "best.pt")
+        last_ckpt_path = os.path.join(fold_dir, "last.pt")
+        log_csv_path = os.path.join(fold_dir, "log.csv")
+        result_csv_path = os.path.join(fold_dir, "result.csv")
 
-    # ---- 输出主目录（稳定命名，不含时间戳）----
-    split_tag = split_mode
-    base = args.out_dir if args.out_dir else f"/root/lanyun-tmp/ugca-runs/{ds_cap}-{split_tag}"
-    if args.sequence:
-        base += "-seq"
-    if args.suffix:
-        base += (args.suffix if args.suffix.startswith("-") else f"-{args.suffix}")
-    out_dir = Path(base)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print("[OUT]", out_dir)
+        train_loader, val_loader, test_loader = datamodule.get_dataloaders(fold)
 
-    # ---- 逐折训练 ----
-    test_metrics_all: List[Dict[str, float]] = []
-    for t, te_idx in enumerate(outer_splits, 1):
-        te_idx = np.asarray(te_idx)
-        if split_mode == "cold-both":
-            # 严格双冷：训练/验证去除任何含测试药物或测试蛋白的样本
-            td = set(drug_key[te_idx]);
-            tp = set(prot_key[te_idx])
-            pool_mask = np.array([(d not in td) and (p not in tp) for d, p in zip(drug_key, prot_key)], dtype=bool)
-            pool_idx = np.where(pool_mask)[0]
-        else:
-            pool_idx = np.setdiff1d(np.arange(N), te_idx)
+        model = build_model(args).to(device)
+        optimizer = build_optimizer(model, args)
+        scheduler = build_scheduler(optimizer, args)
+        criterion = build_criterion(args)
+        scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
-        tr_idx, va_idx = sample_val_indices(
-            split_mode, pool_idx, val_frac_in_pool, seed=args.seed + t,
-            drug_key=drug_key, prot_key=prot_key, labels=np.asarray(labels)
-        )
-        if split_mode.startswith("cold"):
-            set_tr_p, set_va_p, set_te_p = set([proteins[i] for i in tr_idx]), set([proteins[i] for i in va_idx]), set(
-                [proteins[i] for i in te_idx])
-            set_tr_d, set_va_d, set_te_d = set([smiles[i] for i in tr_idx]), set([smiles[i] for i in va_idx]), set(
-                [smiles[i] for i in te_idx])
-            print(
-                f"[fold{t}] overlap P: tr∩va={len(set_tr_p & set_va_p)}, tr∩te={len(set_tr_p & set_te_p)}, va∩te={len(set_va_p & set_te_p)} | "
-                f"D: tr∩va={len(set_tr_d & set_va_d)}, tr∩te={len(set_tr_d & set_te_d)}, va∩te={len(set_va_d & set_te_d)}")
-
-
-        def slice_trip(idx):
-            return [smiles[i] for i in idx], [proteins[i] for i in idx], [labels[i] for i in idx]
-        tr = slice_trip(tr_idx); va = slice_trip(va_idx); te = slice_trip(te_idx)
-
-        # 打印比例
-        def _stat(ix):
-            ys = [labels[i] for i in ix]; pos = sum(1 for v in ys if float(v) >= 0.5)
-            return len(ix), pos, (pos/len(ix) if len(ix) else 0.0)
-        ntr, ptr, rtr = _stat(tr_idx); nva, pva, rva = _stat(va_idx); nte, pte, rte = _stat(te_idx)
-        print(f"[FOLD{t}] train={ntr} (pos={ptr}, {rtr:.3f}) | val={nva} (pos={pva}, {rva:.3f}) | test={nte} (pos={pte}, {rte:.3f})")
-
-        # ---- Data & loaders ----
-        dm = DataModule(
-            DMConfig(
-                train_data=tr, val_data=va, test_data=te,
-                num_workers=args.workers, batch_size=args.batch_size,
-                pin_memory=True, persistent_workers=args.workers>0,
-                prefetch_factor=2, drop_last=False,
-                sequence=args.sequence
-            ),
-            cache_dirs=cache_dirs, dims=dims
-        )
-        train_loader = dm.train_loader()
-        val_loader   = dm.val_loader()
-        test_loader  = dm.test_loader()
-
-        # ---- Model / Optim ----
-        model = build_model_from_src(dims, args).to(device)
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-        # ===== 新增：StepLR（按 epoch 阶梯衰减） =====
-        scheduler = None
-        if getattr(args, "lr_sched", "off") == "step":
-            scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, step_size=args.step_size, gamma=args.gamma
-            )
-
-        fold_dir = out_dir / f"fold{t}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_best = fold_dir / "best.pth"
-        ckpt_last = fold_dir / "last.pth"
-        csv_path  = fold_dir / "metrics.csv"
-
-        # 断点续训：若 summary.csv 存在 → 视为该折完成；否则若 last.pth 存在 → 从其 epoch+1 继续
-        if args.resume:
-            if (fold_dir / "summary.csv").exists():
-                print(f"[RESUME] fold{t} 已完成，跳过。")
-                test_metrics_all.append({k: float("nan") for k in ["auroc","auprc","f1","acc","sen","mcc"]})
-                continue
-
-        with open(csv_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["epoch","train_loss","val_loss","AUROC","AUPRC","F1","ACC","SEN","MCC","time_train_s","time_val_s","thr"])
-
-        best_score = -1.0
-        best_state = None
-        best_thr = 0.5
-        best_metrics = {}
         start_epoch = 1
+        best_val_auprc = -1e9
 
-        no_improve = 0
-        best_epoch = 0
-
-        if args.resume and ckpt_last.exists():
-            sd = torch.load(str(ckpt_last), map_location="cpu")
-            try:
-                model.load_state_dict(sd["state_dict"])
-                if "optimizer" in sd and sd["optimizer"]:
-                    optimizer.load_state_dict(sd["optimizer"])
-                # 恢复 scheduler（若有）
-                if "scheduler" in sd and sd["scheduler"] and scheduler is not None:
-                    scheduler.load_state_dict(sd["scheduler"])
-            except Exception:
-                pass
-            start_epoch = int(sd.get("epoch", 0)) + 1
-            best_thr    = float(sd.get("best_thr", best_thr))
-            best_score  = float(sd.get("best_score", best_score))
-            best_epoch  = int(sd.get("best_epoch", best_epoch))
-            best_metrics= sd.get("best_metrics", best_metrics)
-            print(f"[RESUME] fold{t} 从 epoch {start_epoch} 继续")
-
-        for ep in range(start_epoch, args.epochs + 1):
-            tr_loss, tr_t = train_epoch(
-                model, train_loader, device, optimizer,
-                tag=f"{ds_lower}/train/fold{t}", ep=ep, ep_total=args.epochs,
-                gate_budget=getattr(args, "gate_budget", 0.0),
-                gate_rho=getattr(args, "gate_rho", 0.6),
-                amp_mode=amp_mode, scaler=scaler, amp_dtype=amp_dtype
+        if args.resume and os.path.exists(last_ckpt_path):
+            print(f"[Fold {fold_id}] Resuming from last checkpoint: {last_ckpt_path}")
+            last_epoch, best_val_auprc = load_checkpoint(
+                last_ckpt_path, model, optimizer, scheduler, device
             )
-            va_loss, prob, y, va_t = eval_epoch(model, val_loader, device, amp_mode=amp_mode, amp_dtype=amp_dtype)
-            thr_now = find_best_threshold(prob, y) if (str(args.thr).lower() == "auto") else float(args.thr)
-            m = compute_metrics(prob, y, thr=thr_now)
+            start_epoch = last_epoch + 1
+        else:
+            print(f"[Fold {fold_id}] Start training from scratch.")
+        no_improve_epochs = 0
 
-            with open(csv_path, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([ep, f"{tr_loss:.6f}", f"{va_loss:.6f}",
-                            f"{m['auroc']:.6f}", f"{m['auprc']:.6f}", f"{m['f1']:.6f}",
-                            f"{m['acc']:.6f}", f"{m['sen']:.6f}", f"{m['mcc']:.6f}",
-                            f"{tr_t:.1f}", f"{va_t:.1f}", f"{thr_now:.6f}"])
-            print(f"[{ds_lower}/fold{t}] ep{ep:03d} | train_loss {tr_loss:.4f} | val_loss {va_loss:.4f} | {fmt1(m)} | thr {thr_now:.3f}")
+        for epoch in range(start_epoch, args.epochs + 1):
+            epoch_start_time = time.time()
 
-            # 学习率调度：每个 epoch 结束后 step 一次
+            # ---------- Train ----------
+            train_loss, train_probs, train_labels = train_one_epoch(
+                model, train_loader, device, optimizer, criterion, args, scaler
+            )
+            train_metrics = compute_metrics(train_labels, train_probs, threshold=0.5)
+
+            # ---------- Val ----------
+            val_loss, val_probs, val_labels = evaluate(
+                model, val_loader, device, criterion, args
+            )
+            val_metrics = compute_metrics(val_labels, val_probs, threshold=0.5)
+
+            # scheduler step
             if scheduler is not None:
-                scheduler.step()
+                if args.lr_scheduler == "plateau":
+                    # 用验证集 AUPRC 调整
+                    val_score = val_metrics.get("AUPRC", 0.0)
+                    scheduler.step(val_score)
+                else:
+                    scheduler.step()
 
-            # score 用来监控是否改进（优先 AUPRC）
-            score = m["auprc"] if not math.isnan(m["auprc"]) else m["auroc"]
+            lr = optimizer.param_groups[0]["lr"]
+            epoch_time = time.time() - epoch_start_time
 
+            # 控制台输出：一行 train，一行 val
+            train_str = (
+                f"[Fold {fold_id}] Epoch {epoch:03d} | TRAIN "
+                f"loss={train_loss:.4f} lr={lr:.6f} "
+                f"AUROC={train_metrics['AUROC']:.4f} "
+                f"AUPRC={train_metrics['AUPRC']:.4f} "
+                f"F1={train_metrics['F1']:.4f} "
+                f"ACC={train_metrics['Accuracy']:.4f} "
+                f"Sens={train_metrics['Sensitivity']:.4f} "
+                f"Spec={train_metrics['Specificity']:.4f} "
+                f"Prec={train_metrics['Precision']:.4f} "
+                f"MCC={train_metrics['MCC']:.4f}"
+            )
+            val_str = (
+                f"[Fold {fold_id}] Epoch {epoch:03d} | VALID "
+                f"loss={val_loss:.4f} lr={lr:.6f} "
+                f"AUROC={val_metrics['AUROC']:.4f} "
+                f"AUPRC={val_metrics['AUPRC']:.4f} "
+                f"F1={val_metrics['F1']:.4f} "
+                f"ACC={val_metrics['Accuracy']:.4f} "
+                f"Sens={val_metrics['Sensitivity']:.4f} "
+                f"Spec={val_metrics['Specificity']:.4f} "
+                f"Prec={val_metrics['Precision']:.4f} "
+                f"MCC={val_metrics['MCC']:.4f} "
+                f"time={epoch_time:.1f}s"
+            )
+            print(train_str)
+            print(val_str)
 
-            if score > best_score + args.es_min_delta:
-                best_score = score
-                best_state = copy.deepcopy(model.state_dict())
-                best_thr = float(thr_now)
-                best_metrics = dict(m)
-                best_epoch = ep
-                no_improve = 0
-                # 这里就顺手保存 best
-                torch.save({
-                    "epoch": ep,
-                    "state_dict": model.state_dict(),
-                    "metrics": m,
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": (scheduler.state_dict() if scheduler is not None else None),
-                }, str(ckpt_best))
+            # 记录到 log.csv
+            log_epoch_to_csv(log_csv_path, epoch, "train", train_metrics, train_loss, lr)
+            log_epoch_to_csv(log_csv_path, epoch, "val", val_metrics, val_loss, lr)
+
+            # 保存 last
+            save_checkpoint(
+                last_ckpt_path,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                best_val_auprc,
+            )
+
+            # 根据 val AUPRC 保存 best
+            val_auprc = val_metrics.get("AUPRC", -1e9)
+            prev_best = best_val_auprc
+            if val_auprc > best_val_auprc:
+                best_val_auprc = val_auprc
+                save_checkpoint(
+                    best_ckpt_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    best_val_auprc,
+                )
+                no_improve_epochs = 0  # 🆕 有提升，归零
+                if prev_best < 0:
+                    prev_str = "N/A"
+                else:
+                    prev_str = f"{prev_best:.4f}"
+                print(
+                    f"[Fold {fold_id}] Epoch {epoch:03d} -> NEW BEST VAL AUPRC "
+                    f"{best_val_auprc:.4f} (prev={prev_str}), saved best.pt"
+                )
             else:
-                no_improve += 1
+                no_improve_epochs += 1  # 🆕 没提升，+1
 
-            # 触发早停
-            if args.early_stop and no_improve >= args.early_stop:
-                print(f"[EARLY-STOP] fold{t}: 连续 {args.early_stop} 个 epoch 无提升（best @ ep{best_epoch}）")
+            # 🆕 Early Stopping 判断
+            if no_improve_epochs >= args.patience:
+                print(
+                    f"[Fold {fold_id}] Early stopping at epoch {epoch:03d} "
+                    f"(no val AUPRC improvement in {args.patience} epochs)."
+                )
                 break
 
+        # ---------- 使用 best.pt 做验证阈值搜索 + 测试 ----------
+        if os.path.exists(best_ckpt_path):
+            print(f"[Fold {fold_id}] Loading best checkpoint for testing: {best_ckpt_path}")
+            load_checkpoint(best_ckpt_path, model, None, None, device)
+        else:
+            print(f"[Fold {fold_id}] best.pt not found, using last.pt for testing.")
+            if os.path.exists(last_ckpt_path):
+                load_checkpoint(last_ckpt_path, model, None, None, device)
 
-            # 保存 last.pth（每个 epoch 都覆盖）
-            torch.save({
-                "epoch": ep,
-                "state_dict": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": (scheduler.state_dict() if scheduler is not None else None),
-                "best_thr": best_thr,
-                "best_score": best_score,
-                "best_epoch": best_epoch,
-                "best_metrics": best_metrics,
-            }, str(ckpt_last))
+        # 先在 VAL 上找 F1 最优阈值
+        val_loss_best, val_probs_best, val_labels_best = evaluate(
+            model, val_loader, device, criterion, args
+        )
+        best_thr, best_val_f1 = find_best_f1_threshold(val_labels_best, val_probs_best)
+        val_metrics_best = compute_metrics(val_labels_best, val_probs_best, threshold=best_thr)
+        print(
+            f"[Fold {fold_id}] BEST VAL (for threshold) "
+            f"loss={val_loss_best:.4f} thr={best_thr:.3f} "
+            f"AUROC={val_metrics_best['AUROC']:.4f} "
+            f"AUPRC={val_metrics_best['AUPRC']:.4f} "
+            f"F1={val_metrics_best['F1']:.4f}"
+        )
 
-        print(f"[VAL/fold{t}] best@epoch={best_epoch} | thr*={best_thr:.4f} | {fmt1(best_metrics)}")
+        # 再在 TEST 上用同一个阈值
+        test_loss, test_probs, test_labels = evaluate(
+            model, test_loader, device, criterion, args
+        )
+        test_metrics = compute_metrics(test_labels, test_probs, threshold=best_thr)
+        test_metrics["threshold"] = best_thr  # 顺便记到 csv 里
 
-        # ---- 测试（仅一次；用 thr*）----
-        if ckpt_best.exists():
-            sd = torch.load(str(ckpt_best), map_location="cpu")
-            model.load_state_dict(sd["state_dict"])
-        te_loss, prob, y, te_t = eval_epoch(model, test_loader, device, amp_mode=amp_mode, amp_dtype=amp_dtype)
-        te_m = compute_metrics(prob, y, thr=best_thr)
-        print(f"[TEST/fold{t}] thr={best_thr:.4f} | {fmt1(te_m)} | loss {te_loss:.4f} | time {te_t:.1f}s")
+        print(
+            f"[Fold {fold_id}] TEST "
+            f"loss={test_loss:.4f} thr={best_thr:.3f} "
+            f"AUROC={test_metrics['AUROC']:.4f} "
+            f"AUPRC={test_metrics['AUPRC']:.4f} "
+            f"F1={test_metrics['F1']:.4f} "
+            f"ACC={test_metrics['Accuracy']:.4f} "
+            f"Sens={test_metrics['Sensitivity']:.4f} "
+            f"Spec={test_metrics['Specificity']:.4f} "
+            f"Prec={test_metrics['Precision']:.4f} "
+            f"MCC={test_metrics['MCC']:.4f}"
+        )
 
-        with open(fold_dir / "summary.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["VAL_BEST_EPOCH", best_epoch])
-            w.writerow(["VAL_BEST_THR",   f"{best_thr:.6f}"])
-            for k, v in best_metrics.items():
-                w.writerow([f"VAL_{k.upper()}", f"{v:.6f}"])
-            for k, v in te_m.items():
-                w.writerow([f"TEST_{k.upper()}", f"{v:.6f}"])
-        test_metrics_all.append(te_m)
+        # 保存 result.csv（fold 用 1-based）
+        result_row = {"fold": fold_id}
+        result_row.update(test_metrics)
+        save_result_csv(result_csv_path, result_row)
 
-    # ---- 汇总五折 ----
-    keys = ["auroc","auprc","f1","acc","sen","mcc"]
-    mean = {k: float(np.mean([m[k] for m in test_metrics_all])) for k in keys}
-    std  = {k: float(np.std ([m[k] for m in test_metrics_all])) for k in keys}
-    with open(out_dir / "cv_summary.csv", "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["metric","mean","std"])
-        for k in keys: w.writerow([k.upper(), f"{mean[k]:.6f}", f"{std[k]:.6f}"])
-    print("[CV] " + " | ".join([f"{k.upper()} {mean[k]:.4f}±{std[k]:.4f}" for k in keys]))
+        fold_results.append(result_row)
+
+    # ---------- 所有折结束，生成 summary.csv ----------
+    summary_path = os.path.join(run_dir, "summary.csv")
+    save_summary_csv(summary_path, fold_results)
+    print(f"\nAll folds done. Summary saved to: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
