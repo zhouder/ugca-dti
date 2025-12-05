@@ -17,17 +17,26 @@ CHECK_INTERVAL=30
 TRAIN_CMD='
 python -m src.train \
   --dataset DAVIS \
-  --split-mode warm \
+  --split-mode cold_protein
   --data-root /root/lanyun-tmp \
   --cache-root /root/lanyun-tmp/cache \
-  --output-dir /root/lanyun-tmp/ugca-runs/DAVIS-A5 \
+  --batch-size 64 \
+  --nlayers 2 \
+  --nhead 4 \
+  --d-model 256 \
+  --d-fuse 512 \
+  --gate-mode mu_times_evi \
+  --g-min 1e-3 \
+  --lamb 1.0 \
+  --temp 1.0 \
   --pooling meanmax \
   --fusion-head match-mlp \
-  --loss focal --lr-scheduler cosine \
-  --epochs 100 --batch-size 64 \
-  --lr 2e-4 --weight-decay 1e-2 \
+  --loss focal \
+  --lr 2e-4 \
+  --epochs 100 \
   --patience 10 \
-  --amp --nlayers 3 --nhead 8 --dim-feedforward 768
+  --run-all \
+  --device cuda
 '
 
 ########################################
