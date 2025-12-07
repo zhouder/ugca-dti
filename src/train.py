@@ -215,7 +215,8 @@ def train_single_fold(args, fold_idx):
             "Val_Loss", "Val_AUC", "Val_AUPRC", "Val_F1", "Val_Acc", "Val_Sens", "Val_Spec", "Val_Prec", "Val_MCC"]
 
     if not os.path.exists(log_path) or start_epoch == 0:
-        with open(log_path, 'w') as f: f.write(",".join(cols) + "\n")
+        with open(log_path, 'w') as f:
+            f.write(",".join(cols) + "\n")
 
     for epoch in range(start_epoch, args.epochs):
         curr_lr = optimizer.param_groups[0]['lr']
@@ -224,7 +225,8 @@ def train_single_fold(args, fold_idx):
         train_res = run_epoch(model, dm.train_dataloader(), criterion, optimizer, args.device, is_train=True)
         val_res = run_epoch(model, dm.val_dataloader(), criterion, optimizer, args.device, is_train=False)
 
-        if scheduler: scheduler.step()
+        if scheduler:
+            scheduler.step()
 
         print_metrics(train_res, "Train")
         print_metrics(val_res, "Val  ")
@@ -240,8 +242,12 @@ def train_single_fold(args, fold_idx):
         # Save
         curr_val = val_res[monitor_key]
         torch.save(
-            {'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
-             'best_metric': best_metric}, last_ckpt)
+            {'epoch': epoch,
+             'model_state_dict': model.state_dict(),
+             'optimizer_state_dict': optimizer.state_dict(),
+             'best_metric': best_metric},
+            last_ckpt
+        )
 
         if curr_val > best_metric:
             best_metric = curr_val
@@ -251,7 +257,7 @@ def train_single_fold(args, fold_idx):
         else:
             patience += 1
             if patience >= args.patience:
-                print(f"Early stopping at epoch {epoch + 1}");
+                print(f"Early stopping at epoch {epoch + 1}")
                 break
 
     # Final Test
@@ -260,7 +266,7 @@ def train_single_fold(args, fold_idx):
     model.load_state_dict(ckpt['model_state_dict'])
     test_res = run_epoch(model, dm.test_dataloader(), criterion, optimizer, args.device, is_train=False)
 
-    print("\nTest Results:");
+    print("\nTest Results:")
     print_metrics(test_res, "Test ")
 
     res_df = pd.DataFrame([test_res])
