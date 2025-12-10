@@ -96,8 +96,8 @@ def get_args():
 
     # Model Structure
     parser.add_argument('--d-model', type=int, default=128)
-    parser.add_argument('--nlayers', type=int, default=2)
-    parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--nlayers', type=int, default=3)
+    parser.add_argument('--nhead', type=int, default=8)
     parser.add_argument('--d-fuse', type=int, default=256)
     parser.add_argument('--gate-mode', type=str, default='mu_times_evi')
     parser.add_argument('--pooling', type=str, default='attn', choices=['meanmax', 'attn', 'mh-attn'])
@@ -108,19 +108,19 @@ def get_args():
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--wd', type=float, default=2e-2, help='Weight Decay')
+    parser.add_argument('--wd', type=float, default=1e-2, help='Weight Decay')
 
     # Switches
     parser.add_argument('--lr-scheduler', type=str, default='cosine', choices=['cosine', 'none'])
     parser.add_argument('--loss', type=str, default='bce', choices=['focal', 'bce'])
     parser.add_argument('--monitor', type=str, default='auprc', choices=['auprc', 'auroc'],
                         help='Metric to select best model')
-    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--patience', type=int, default=20)
 
     # Misc
-    parser.add_argument('--num-workers', type=int, default=6)
-    parser.add_argument('--lamb', type=float, default=0.8)
-    parser.add_argument('--temp', type=float, default=0.8)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--lamb', type=float, default=0.6)
+    parser.add_argument('--temp', type=float, default=0.6)
     parser.add_argument('--g-min', type=float, default=1e-3)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
