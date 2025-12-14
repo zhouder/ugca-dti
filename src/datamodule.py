@@ -1,261 +1,483 @@
-# datamodule.py
-import os
-import random
+# src/datamodule.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 from dataclasses import dataclass
-from hashlib import sha1
-from typing import List, Tuple, Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+import csv
+import hashlib
+import random
 
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from sklearn.model_selection import KFold
 
 
-def set_global_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+# ---------------- configs ----------------
+@dataclass
+class DMConfig:
+    train_data: Tuple[List[str], List[str], List[float]]
+    val_data:   Tuple[List[str], List[str], List[float]]
+    test_data:  Tuple[List[str], List[str], List[float]]
 
+    batch_size: int = 64
+    num_workers: int = 4
+    pin_memory: bool = False
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+    drop_last: bool = False
 
-def sha1_24(s: str) -> str:
-    return sha1(s.encode("utf-8")).hexdigest()[:24]
-
-
-def _first_array_from_npz(npz: np.lib.npyio.NpzFile) -> np.ndarray:
-    for k in npz.files:
-        arr = np.array(npz[k])
-        if arr.ndim >= 2:
-            return arr
-    return np.array(npz[npz.files[0]])
-
-
-def load_feature(base: str) -> np.ndarray:
-    npz_path = base + ".npz"
-    npy_path = base + ".npy"
-    if os.path.exists(npz_path):
-        with np.load(npz_path) as f:
-            arr = _first_array_from_npz(f)
-    elif os.path.exists(npy_path):
-        arr = np.load(npy_path)
-    else:
-        raise FileNotFoundError(f"Feature not found: {npz_path} / {npy_path}")
-    if arr.ndim == 1:
-        arr = arr[:, None]
-    return arr.astype(np.float32)
-
-
-def _exists_feature(base: str) -> bool:
-    return os.path.exists(base + ".npz") or os.path.exists(base + ".npy")
-
-
-class DTIDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, dataset_name: str, cache_root: str):
-        super().__init__()
-        self.df = df.reset_index(drop=True)
-        self.dataset = dataset_name
-        self.cache_root = cache_root
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        smiles = str(row["smiles"])
-        protein = str(row["protein"])
-        label = float(row["label"])
-
-        did = sha1_24(smiles)
-        pid = sha1_24(protein)
-
-        mol_base = os.path.join(self.cache_root, "molclr", self.dataset, did)
-        prot_base = os.path.join(self.cache_root, "esm2", self.dataset, pid)
-
-        mol = load_feature(mol_base)   # [Ld, d_mol]
-        prot = load_feature(prot_base) # [Lp, d_prot]
-
-        return {
-            "mol": torch.from_numpy(mol),
-            "prot": torch.from_numpy(prot),
-            "label": torch.tensor([label], dtype=torch.float32),
-        }
-
-
-def dti_collate(batch: List[Dict]):
-    mol_seqs = [b["mol"] for b in batch]
-    prot_seqs = [b["prot"] for b in batch]
-    labels = torch.cat([b["label"] for b in batch], dim=0)
-
-    mol_padded = pad_sequence(mol_seqs, batch_first=True, padding_value=0.0)
-    prot_padded = pad_sequence(prot_seqs, batch_first=True, padding_value=0.0)
-
-    B, Ld_max, _ = mol_padded.shape
-    _, Lp_max, _ = prot_padded.shape
-    mask_d = torch.zeros((B, Ld_max), dtype=torch.int)
-    mask_p = torch.zeros((B, Lp_max), dtype=torch.int)
-    for i, (md, pp) in enumerate(zip(mol_seqs, prot_seqs)):
-        mask_d[i, : md.shape[0]] = 1
-        mask_p[i, : pp.shape[0]] = 1
-
-    return {"mol": mol_padded, "prot": prot_padded, "mask_d": mask_d, "mask_p": mask_p, "label": labels}
+    sequence: bool = False
+    use_pocket: bool = False
 
 
 @dataclass
-class FoldIndex:
-    train_idx: np.ndarray
-    val_idx: np.ndarray
-    test_idx: np.ndarray
+class CacheDirs:
+    esm_dir: str
+    molclr_dir: str
+    chemberta_dir: str
+    pocket_dir: str
 
 
-class DTIDataModule:
-    """
-    读取 <data_root>/<dataset>/all.csv：列为 smiles, protein, label
-    构建 5 折：
-      - warm/random: KFold on samples
-      - cold_drug:   KFold on unique smiles
-      - cold_protein:KFold on unique protein
-      - cold_both:   drug/protein 同时冷（不足则退化为 OR）
-    """
-    def __init__(
-        self,
-        data_root: str,
-        cache_root: str,
-        dataset: str,
-        split_mode: str = "warm",
-        batch_size: int = 64,
-        num_workers: int = 4,
-        seed: int = 42,
-    ):
-        self.data_root = data_root
-        self.cache_root = cache_root
-        self.dataset = dataset
-        self.split_mode = split_mode
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.seed = seed
+@dataclass
+class CacheDims:
+    esm2: int
+    molclr: int
+    chemberta: int
 
-        csv_path = os.path.join(self.data_root, dataset, "all.csv")
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV not found: {csv_path}")
-        self.df = pd.read_csv(csv_path)
-        for col in ["smiles", "protein", "label"]:
-            if col not in self.df.columns:
-                raise ValueError(f"Column '{col}' missing in all.csv")
 
-        set_global_seed(seed)
-        self.folds = self._build_folds()
+# ---------------- basic utils ----------------
+def _sha1_24(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:24]
 
-    def compute_cache_hit_rate(self) -> dict:
-        total = len(self.df)
-        miss_mol = miss_prot = miss_both = hit_both = 0
-        for _, row in self.df.iterrows():
-            did = sha1_24(str(row["smiles"]))
-            pid = sha1_24(str(row["protein"]))
-            mol_base = os.path.join(self.cache_root, "molclr", self.dataset, did)
-            prot_base = os.path.join(self.cache_root, "esm2", self.dataset, pid)
-            has_mol = _exists_feature(mol_base)
-            has_prot = _exists_feature(prot_base)
-            if has_mol and has_prot:
-                hit_both += 1
-            elif (not has_mol) and (not has_prot):
-                miss_both += 1
-            elif not has_mol:
-                miss_mol += 1
+
+def _index_npz_dir(dir_path: Path) -> Dict[str, Path]:
+    tbl: Dict[str, Path] = {}
+    if not dir_path.exists():
+        return tbl
+    for p in dir_path.rglob("*.npz"):
+        tbl[p.stem] = p
+    return tbl
+
+
+def _npz_load(p: Path) -> Dict[str, np.ndarray]:
+    with np.load(str(p), allow_pickle=False) as z:
+        return {k: z[k] for k in z.files}
+
+
+def _npz_load_first_key(p: Optional[Path]) -> Optional[np.ndarray]:
+    if p is None or (not p.exists()):
+        return None
+    with np.load(str(p), allow_pickle=False) as z:
+        k = list(z.files)[0]
+        return z[k]
+
+
+def _as_1d(x: Optional[np.ndarray], target_dim: int) -> np.ndarray:
+    if x is None:
+        out = np.zeros((target_dim,), dtype=np.float32)
+    else:
+        x = np.asarray(x)
+        if x.ndim == 2:
+            x = x.mean(axis=0)
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.shape[0] < target_dim:
+            out = np.concatenate([x, np.zeros((target_dim - x.shape[0],), dtype=np.float32)], axis=0)
+        else:
+            out = x[:target_dim]
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def _as_2d(x: Optional[np.ndarray]) -> np.ndarray:
+    if x is None:
+        return np.zeros((0, 1), dtype=np.float32)
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x[None, :]
+    return np.asarray(x, dtype=np.float32, order="C")
+
+
+def _read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[float]]:
+    smiles, proteins, labels = [], [], []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+
+        si = pi = li = 0
+        if header:
+            heads = [c.strip().lower() for c in header]
+            if all(x in heads for x in ("smiles", "protein", "label")):
+                si, pi, li = heads.index("smiles"), heads.index("protein"), heads.index("label")
             else:
-                miss_prot += 1
-        pos_ratio = float(self.df["label"].astype(float).mean())
+                si, pi, li = 0, 1, 2
+                # header 可能就是数据行
+                if len(header) >= 3:
+                    try:
+                        smiles.append(header[si]); proteins.append(header[pi]); labels.append(float(header[li]))
+                    except Exception:
+                        pass
+
+        for row in reader:
+            if len(row) <= max(si, pi, li):
+                continue
+            try:
+                smiles.append(row[si])
+                proteins.append(row[pi])
+                labels.append(float(row[li]))
+            except Exception:
+                continue
+    return smiles, proteins, labels
+
+
+_AMINO = set("ACDEFGHIKLMNPQRSTVWY")
+def _prot_variants(s: str) -> List[str]:
+    raw = s or ""
+    v = [raw, raw.strip(), "".join(raw.split()), "".join(raw.split()).upper()]
+    only_aa = "".join(ch for ch in raw if ch.upper() in _AMINO)
+    if only_aa:
+        v += [only_aa, only_aa.upper()]
+    out, seen = [], set()
+    for x in v:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+
+def _smiles_variants(s: str) -> List[str]:
+    raw = s or ""
+    v = [raw, raw.strip(), "".join(raw.split())]
+    out, seen = [], set()
+    for x in v:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+
+def _lookup(tbl: Dict[str, Path], keys: List[str]) -> Optional[Path]:
+    for k in keys:
+        p = tbl.get(_sha1_24(k))
+        if p is not None:
+            return p
+    return None
+
+
+# ---------------- pocket helpers ----------------
+def _factorize_to_int(arr: np.ndarray) -> np.ndarray:
+    """把字符串/对象数组编码为 0..K-1"""
+    flat = arr.reshape(-1)
+    mp: Dict[str, int] = {}
+    out = np.empty((flat.shape[0],), dtype=np.int64)
+    for i, x in enumerate(flat):
+        s = str(x)
+        if s not in mp:
+            mp[s] = len(mp)
+        out[i] = mp[s]
+    return out.reshape(arr.shape)
+
+
+def _pocket_to_tensors(npz: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+    """
+    只保留我们真正用得到的数值字段；跳过 pid 等字符串字段。
+    若 chain_id 是字符串（'A','B'），编码为 int。
+    """
+    keep = ["node_scalar_feat", "coords", "edge_index", "edge_scalar_feat", "res_idx", "chain_id"]
+    out: Dict[str, torch.Tensor] = {}
+
+    for k in keep:
+        if k not in npz:
+            continue
+
+        arr = np.asarray(npz[k])
+
+        # 跳过纯字符串/对象的异常字段（以防万一）
+        if arr.dtype.kind in ("U", "S", "O"):
+            if k == "chain_id":
+                arr_i = _factorize_to_int(arr)
+                out[k] = torch.as_tensor(arr_i, dtype=torch.long)
+            elif k == "res_idx":
+                # 理论上应该是 int；如果变成字符串，也做 factorize，至少不报错
+                arr_i = _factorize_to_int(arr)
+                out[k] = torch.as_tensor(arr_i, dtype=torch.long)
+            else:
+                # 例如 pid，直接跳过
+                continue
+            continue
+
+        # 数值字段
+        if k in ("edge_index", "res_idx", "chain_id"):
+            out[k] = torch.as_tensor(arr.astype(np.int64, copy=False), dtype=torch.long)
+        else:
+            out[k] = torch.as_tensor(arr.astype(np.float32, copy=False), dtype=torch.float32)
+
+    # 确保空缺字段存在（避免模型 KeyError）
+    out.setdefault("node_scalar_feat", torch.zeros((0, 21), dtype=torch.float32))
+    out.setdefault("coords", torch.zeros((0, 3), dtype=torch.float32))
+    out.setdefault("edge_index", torch.zeros((2, 0), dtype=torch.long))
+    out.setdefault("edge_scalar_feat", torch.zeros((0, 1), dtype=torch.float32))
+    out.setdefault("res_idx", torch.zeros((0,), dtype=torch.long))
+    out.setdefault("chain_id", torch.zeros((0,), dtype=torch.long))
+
+    return out
+
+
+# ---------------- dataset ----------------
+class DTIDataset(Dataset):
+    def __init__(self,
+                 data: Tuple[List[str], List[str], List[float]],
+                 esm_tbl: Dict[str, Path],
+                 molclr_tbl: Dict[str, Path],
+                 chem_tbl: Dict[str, Path],
+                 pocket_tbl: Dict[str, Path],
+                 dims: CacheDims,
+                 sequence: bool,
+                 use_pocket: bool):
+        self.smiles, self.proteins, self.labels = data
+        self.esm_tbl = esm_tbl
+        self.molclr_tbl = molclr_tbl
+        self.chem_tbl = chem_tbl
+        self.pocket_tbl = pocket_tbl
+        self.dims = dims
+        self.sequence = sequence
+        self.use_pocket = use_pocket
+
+        # small cache reduce IO
+        self._cache_esm = {}
+        self._cache_mol = {}
+        self._cache_chem = {}
+        self._cache_pocket = {}
+
+    def __len__(self):
+        return len(self.labels)
+
+    def _vec_cached(self, p: Optional[Path], d: int, cache: dict) -> torch.Tensor:
+        if p is None:
+            return torch.zeros((d,), dtype=torch.float32)
+        k = str(p)
+        t = cache.get(k)
+        if t is None:
+            arr = _as_1d(_npz_load_first_key(p), d)
+            t = torch.tensor(arr, dtype=torch.float32)
+            cache[k] = t
+        return t
+
+    def _seq_cached(self, p: Optional[Path], cache: dict) -> np.ndarray:
+        if p is None:
+            return np.zeros((0, 1), dtype=np.float32)
+        k = str(p)
+        v = cache.get(k)
+        if v is None:
+            v = _as_2d(_npz_load_first_key(p))
+            cache[k] = v
+        return v
+
+    def _pocket_cached(self, p: Optional[Path]) -> Dict[str, torch.Tensor]:
+        if p is None:
+            return _pocket_to_tensors({})
+        k = str(p)
+        d = self._cache_pocket.get(k)
+        if d is None:
+            npz = _npz_load(p)
+            d = _pocket_to_tensors(npz)
+            self._cache_pocket[k] = d
+        return d
+
+    def __getitem__(self, idx: int):
+        smi = self.smiles[idx]
+        pro = self.proteins[idx]
+        y = float(self.labels[idx])
+
+        p_path = _lookup(self.esm_tbl, _prot_variants(pro))
+        d1_path = _lookup(self.molclr_tbl, _smiles_variants(smi))
+        c_path = _lookup(self.chem_tbl, _smiles_variants(smi))
+
+        pocket_path = None
+        if self.use_pocket:
+            pocket_path = _lookup(self.pocket_tbl, _prot_variants(pro))
+
+        if not self.sequence:
+            vp = self._vec_cached(p_path, self.dims.esm2, self._cache_esm)
+            vd = self._vec_cached(d1_path, self.dims.molclr, self._cache_mol)
+            vc = self._vec_cached(c_path, self.dims.chemberta, self._cache_chem)
+            return vp, vd, vc, torch.tensor(y, dtype=torch.float32)
+
+        # sequence mode
+        P = self._seq_cached(p_path, self._cache_esm)
+        D = self._seq_cached(d1_path, self._cache_mol)
+        C = self._seq_cached(c_path, self._cache_chem)
+        if C.ndim == 2:
+            C = C.mean(axis=0)  # (dc,)
+
+        if self.use_pocket:
+            pocket = self._pocket_cached(pocket_path)
+            return P, D, C.astype(np.float32, copy=True), pocket, np.float32(y)
+        else:
+            return P, D, C.astype(np.float32, copy=True), np.float32(y)
+
+
+# ---------------- collate ----------------
+def _pad_and_mask(batch_list: List[np.ndarray]) -> Tuple[torch.Tensor, torch.Tensor]:
+    lens = [x.shape[0] for x in batch_list]
+    d = max([x.shape[1] for x in batch_list] + [1])
+    tmax = max(lens + [1])
+    B = len(batch_list)
+    out = np.zeros((B, tmax, d), dtype=np.float32)
+    mask = np.zeros((B, tmax), dtype=bool)
+    for i, x in enumerate(batch_list):
+        L = x.shape[0]
+        out[i, :L, :x.shape[1]] = x
+        mask[i, :L] = True
+    return torch.tensor(out, dtype=torch.float32), torch.tensor(mask, dtype=torch.bool)
+
+
+class DataModule:
+    def __init__(self, cfg: DMConfig, cache_dirs: CacheDirs, dims: CacheDims, verbose: bool = False):
+        self.cfg = cfg
+        self.dims = dims
+        self.verbose = verbose
+
+        # esm/esm2 fallback
+        cand = [Path(cache_dirs.esm_dir)]
+        if "/esm2/" in cache_dirs.esm_dir:
+            cand.append(Path(cache_dirs.esm_dir.replace("/esm2/", "/esm/")))
+        elif "/esm/" in cache_dirs.esm_dir:
+            cand.append(Path(cache_dirs.esm_dir.replace("/esm/", "/esm2/")))
+
+        picked = None
+        esm_tbl = {}
+        for c in cand:
+            tbl = _index_npz_dir(c)
+            if tbl:
+                picked, esm_tbl = c, tbl
+                break
+        if picked is None:
+            picked = cand[0]
+            esm_tbl = _index_npz_dir(picked)
+
+        self.esm_dir_used = str(picked)
+        self.esm_tbl = esm_tbl
+        self.molclr_tbl = _index_npz_dir(Path(cache_dirs.molclr_dir))
+        self.chem_tbl = _index_npz_dir(Path(cache_dirs.chemberta_dir))
+        self.pocket_tbl = _index_npz_dir(Path(cache_dirs.pocket_dir))
+
+        self._summary = self._build_summary()
+
+    def _hit_rate(self, data: Tuple[List[str], List[str], List[float]], sample_cap: int = 2000) -> str:
+        smi, pro, _ = data
+        n = len(smi)
+        if n == 0:
+            return "NA"
+        idxs = list(range(n))
+        if n > sample_cap:
+            random.seed(42)
+            idxs = random.sample(idxs, sample_cap)
+
+        hit_all = 0
+        for i in idxs:
+            p = _lookup(self.esm_tbl, _prot_variants(pro[i]))
+            d = _lookup(self.molclr_tbl, _smiles_variants(smi[i]))
+            c = _lookup(self.chem_tbl, _smiles_variants(smi[i]))
+            if self.cfg.use_pocket:
+                pk = _lookup(self.pocket_tbl, _prot_variants(pro[i]))
+                ok = (p is not None) and (d is not None) and (c is not None) and (pk is not None)
+            else:
+                ok = (p is not None) and (d is not None) and (c is not None)
+            hit_all += int(ok)
+        return f"{hit_all/len(idxs)*100:.1f}%"
+
+    def _uniq_counts(self, data: Tuple[List[str], List[str], List[float]]) -> Tuple[int, int]:
+        smi, pro, _ = data
+        return len(set(smi)), len(set(pro))
+
+    def _build_summary(self) -> Dict[str, Any]:
         return {
-            "total": int(total),
-            "hit_both": int(hit_both),
-            "miss_mol": int(miss_mol),
-            "miss_prot": int(miss_prot),
-            "miss_both": int(miss_both),
-            "pos_ratio": pos_ratio,
-            "hit_rate": (hit_both / total) if total > 0 else 0.0,
+            "index_size": {
+                "esm": len(self.esm_tbl),
+                "molclr": len(self.molclr_tbl),
+                "chemberta": len(self.chem_tbl),
+                "pocket": len(self.pocket_tbl),
+            },
+            "hit_rate": {
+                "train": self._hit_rate(self.cfg.train_data),
+                "val": self._hit_rate(self.cfg.val_data),
+                "test": self._hit_rate(self.cfg.test_data),
+            },
+            "uniq": {
+                "train": self._uniq_counts(self.cfg.train_data),
+                "val": self._uniq_counts(self.cfg.val_data),
+                "test": self._uniq_counts(self.cfg.test_data),
+            }
         }
 
-    def _build_folds(self) -> List[FoldIndex]:
-        n_splits = 5
-        rng = np.random.RandomState(self.seed)
+    def summary(self) -> Dict[str, Any]:
+        return self._summary
 
-        def split_train_val(indices: np.ndarray, val_ratio: float = 0.125) -> Tuple[np.ndarray, np.ndarray]:
-            n = len(indices)
-            n_val = max(1, int(round(n * val_ratio)))
-            perm = rng.permutation(indices)
-            return perm[n_val:], perm[:n_val]
+    def _collate_v1(self, b):
+        vp = torch.stack([x[0] for x in b], dim=0)
+        vd = torch.stack([x[1] for x in b], dim=0)
+        vc = torch.stack([x[2] for x in b], dim=0)
+        y = torch.stack([x[3] if torch.is_tensor(x[3]) else torch.tensor(x[3], dtype=torch.float32) for x in b], dim=0)
+        return vp, vd, vc, y
 
-        folds: List[FoldIndex] = []
-        if self.split_mode in ["warm", "random"]:
-            kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
-            for train, test in kf.split(self.df):
-                tr, va = split_train_val(np.array(train))
-                folds.append(FoldIndex(train_idx=tr, val_idx=va, test_idx=np.array(test)))
-            return folds
+    def _collate_v2(self, b):
+        P_list = [x[0] for x in b]
+        D_list = [x[1] for x in b]
+        C_list = [x[2] for x in b]
+        y_list = [x[3] for x in b]
 
-        if self.split_mode == "cold_drug":
-            uniques = self.df["smiles"].astype(str).drop_duplicates().values
-            kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
-            for _, test_u_idx in kf.split(uniques):
-                test_smiles = set(uniques[test_u_idx])
-                mask_test = self.df["smiles"].astype(str).isin(test_smiles).values
-                test_idx = np.where(mask_test)[0]
-                warm_idx = np.where(~mask_test)[0]
-                tr, va = split_train_val(warm_idx)
-                folds.append(FoldIndex(train_idx=tr, val_idx=va, test_idx=test_idx))
-            return folds
+        P, Pm = _pad_and_mask(P_list)
+        D, Dm = _pad_and_mask(D_list)
+        C = torch.tensor(np.stack(C_list, axis=0), dtype=torch.float32)
+        y = torch.tensor(np.asarray(y_list, dtype=np.float32), dtype=torch.float32)
+        return P, Pm, D, Dm, C, y
 
-        if self.split_mode == "cold_protein":
-            uniques = self.df["protein"].astype(str).drop_duplicates().values
-            kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
-            for _, test_u_idx in kf.split(uniques):
-                test_prot = set(uniques[test_u_idx])
-                mask_test = self.df["protein"].astype(str).isin(test_prot).values
-                test_idx = np.where(mask_test)[0]
-                warm_idx = np.where(~mask_test)[0]
-                tr, va = split_train_val(warm_idx)
-                folds.append(FoldIndex(train_idx=tr, val_idx=va, test_idx=test_idx))
-            return folds
+    def _collate_v2_pocket(self, b):
+        P_list = [x[0] for x in b]
+        D_list = [x[1] for x in b]
+        C_list = [x[2] for x in b]
+        pocket_list = [x[3] for x in b]
+        y_list = [x[4] for x in b]
 
-        if self.split_mode == "cold_both":
-            uniq_d = self.df["smiles"].astype(str).drop_duplicates().values
-            uniq_p = self.df["protein"].astype(str).drop_duplicates().values
-            kf_d = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
-            kf_p = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed + 1)
-            for (_, test_d_idx), (_, test_p_idx) in zip(kf_d.split(uniq_d), kf_p.split(uniq_p)):
-                test_drugs = set(uniq_d[test_d_idx])
-                test_prots = set(uniq_p[test_p_idx])
-                mask_test = self.df["smiles"].astype(str).isin(test_drugs) & self.df["protein"].astype(str).isin(test_prots)
-                test_idx = np.where(mask_test.values)[0]
-                if len(test_idx) < 1:  # 保障非空
-                    mask_test = self.df["smiles"].astype(str).isin(test_drugs) | self.df["protein"].astype(str).isin(test_prots)
-                    test_idx = np.where(mask_test.values)[0]
-                warm_idx = np.where(~mask_test.values)[0]
-                tr, va = split_train_val(warm_idx)
-                folds.append(FoldIndex(train_idx=tr, val_idx=va, test_idx=test_idx))
-            return folds
+        P, Pm = _pad_and_mask(P_list)
+        D, Dm = _pad_and_mask(D_list)
+        C = torch.tensor(np.stack(C_list, axis=0), dtype=torch.float32)
+        y = torch.tensor(np.asarray(y_list, dtype=np.float32), dtype=torch.float32)
+        return P, Pm, D, Dm, C, pocket_list, y
 
-        raise ValueError(f"Unknown split_mode: {self.split_mode}")
+    def _make_loader(self, data, shuffle: bool) -> DataLoader:
+        ds = DTIDataset(
+            data=data,
+            esm_tbl=self.esm_tbl,
+            molclr_tbl=self.molclr_tbl,
+            chem_tbl=self.chem_tbl,
+            pocket_tbl=self.pocket_tbl,
+            dims=self.dims,
+            sequence=self.cfg.sequence,
+            use_pocket=self.cfg.use_pocket,
+        )
 
-    def get_input_dims(self) -> Tuple[int, int]:
-        row = self.df.iloc[0]
-        did = sha1_24(str(row["smiles"]))
-        pid = sha1_24(str(row["protein"]))
-        mol = load_feature(os.path.join(self.cache_root, "molclr", self.dataset, did))
-        prot = load_feature(os.path.join(self.cache_root, "esm2", self.dataset, pid))
-        return int(mol.shape[1]), int(prot.shape[1])
+        if not self.cfg.sequence:
+            collate_fn = self._collate_v1
+        else:
+            collate_fn = self._collate_v2_pocket if self.cfg.use_pocket else self._collate_v2
 
-    def get_loaders_for_fold(self, fold_idx: int) -> Tuple[DataLoader, DataLoader, DataLoader]:
-        fi = self.folds[fold_idx]
-        ds_train = DTIDataset(self.df.iloc[fi.train_idx], self.dataset, self.cache_root)
-        ds_val = DTIDataset(self.df.iloc[fi.val_idx], self.dataset, self.cache_root)
-        ds_test = DTIDataset(self.df.iloc[fi.test_idx], self.dataset, self.cache_root)
+        return DataLoader(
+            ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=shuffle,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory,
+            persistent_workers=self.cfg.persistent_workers,
+            prefetch_factor=self.cfg.prefetch_factor,
+            drop_last=(self.cfg.drop_last if shuffle else False),
+            collate_fn=collate_fn,
+        )
 
-        train_loader = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True,
-                                  num_workers=self.num_workers, pin_memory=True, collate_fn=dti_collate)
-        val_loader = DataLoader(ds_val, batch_size=self.batch_size, shuffle=False,
-                                num_workers=self.num_workers, pin_memory=True, collate_fn=dti_collate)
-        test_loader = DataLoader(ds_test, batch_size=self.batch_size, shuffle=False,
-                                 num_workers=self.num_workers, pin_memory=True, collate_fn=dti_collate)
-        return train_loader, val_loader, test_loader
+    def train_loader(self) -> DataLoader:
+        return self._make_loader(self.cfg.train_data, shuffle=True)
+
+    def val_loader(self) -> DataLoader:
+        return self._make_loader(self.cfg.val_data, shuffle=False)
+
+    def test_loader(self) -> DataLoader:
+        return self._make_loader(self.cfg.test_data, shuffle=False)

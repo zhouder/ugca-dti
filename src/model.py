@@ -1,278 +1,402 @@
-# model.py
-import math
-from typing import Tuple, Literal, Optional
+# src/model.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _masked_fill(logits: torch.Tensor, key_padding_mask: torch.Tensor, value: float):
+# ---------------------------
+# Utils
+# ---------------------------
+def masked_mean(x: torch.Tensor, m: torch.Tensor, dim: int = 1, eps: float = 1e-6) -> torch.Tensor:
     """
-    logits: [B, H, Lq, Lk]
-    key_padding_mask: [B, Lk]  (1 = valid, 0 = pad)
+    x: (B, T, D), m: (B, T) bool (True=valid)
+    return: (B, D)
     """
-    if key_padding_mask is None:
-        return logits
-    mask = (key_padding_mask == 0).unsqueeze(1).unsqueeze(2)  # [B,1,1,Lk]
-    return logits.masked_fill(mask, value)
+    m = m.to(dtype=x.dtype)
+    num = (x * m.unsqueeze(-1)).sum(dim=dim)
+    den = m.sum(dim=dim).clamp_min(eps).unsqueeze(-1)
+    return num / den
 
 
-class FeedForward(nn.Module):
-    def __init__(self, d_model: int, d_ff: Optional[int] = None, dropout: float = 0.1):
+def attention_entropy(attn: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """
+    attn: (B, H, Lq, Lk) attention prob
+    returns: (B, Lq, 1) normalized entropy in [0, 1]
+    """
+    p = attn.clamp_min(eps)
+    ent = -(p * p.log()).sum(dim=-1)  # (B,H,Lq)
+    lk = attn.size(-1)
+    ent = ent / (torch.log(torch.tensor(float(lk), device=attn.device)).clamp_min(eps))
+    ent = ent.mean(dim=1, keepdim=False)  # (B, Lq)
+    return ent.unsqueeze(-1)              # (B, Lq, 1)
+
+
+# ---------------------------
+# PocketGraph Encoder (simple, no PyG dependency)
+# ---------------------------
+class PocketGraphEncoder(nn.Module):
+    """
+    输入：残基图
+      - node_scalar_feat: (N, Fin)  (你的 npz 里目前是 21 维 AA one-hot)
+      - edge_index: (2, E) long
+    输出：全局向量 (d_model,)
+    """
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.1):
         super().__init__()
-        d_ff = d_ff or (4 * d_model)
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class UncertaintyGate(nn.Module):
-    """
-    NIG 证据头 -> gate g_i ∈ (0,1]，支持三种模式
-    """
-    def __init__(
-        self,
-        d_model: int,
-        hidden: Optional[int] = None,
-        dropout: float = 0.1,
-        gate_mode: Literal["mu_times_evi", "mu_only", "evi_only"] = "mu_times_evi",
-        lamb: float = 1.0,
-        g_min: float = 1e-3,
-    ):
-        super().__init__()
-        hidden = hidden or d_model
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 4),  # mu, nu, alpha, beta
-        )
-        self.gate_mode = gate_mode
-        self.lamb = lamb
-        self.g_min = g_min
-
-    def forward(self, h: torch.Tensor):
-        out = self.mlp(h)  # [B,L,4]
-        mu, nu, alpha, beta = out.unbind(dim=-1)
-        nu = F.softplus(nu) + 1e-4
-        alpha = F.softplus(alpha) + 1.0 + 1e-4
-        beta = F.softplus(beta) + 1e-4
-
-        sigma_e2 = beta / (nu * (alpha - 1.0))
-        if self.gate_mode == "mu_only":
-            g = torch.sigmoid(mu)
-        elif self.gate_mode == "evi_only":
-            g = torch.exp(-self.lamb * sigma_e2)
-        else:
-            g = torch.sigmoid(mu) * torch.exp(-self.lamb * sigma_e2)
-
-        return torch.clamp(g, min=self.g_min, max=1.0)
-
-
-class GatedCrossAttention(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1, temp: float = 0.8):
-        super().__init__()
-        assert d_model % nhead == 0
-        self.d_model = d_model
-        self.nhead = nhead
-        self.d_head = d_model // nhead
-        self.temp = temp
-
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
+        self.fc_in = nn.Linear(in_dim, hidden_dim)
+        self.fc_self = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_nei  = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, Q_src, KV_src, key_gate, key_padding_mask=None):
-        B, Lq, _ = Q_src.shape
-        Lk = KV_src.shape[1]
+    def forward(self, node_scalar: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        """
+        node_scalar: (N, Fin) float
+        edge_index:  (2, E) long
+        """
+        if node_scalar is None or node_scalar.numel() == 0:
+            return torch.zeros((self.fc_out.out_features,), device=edge_index.device, dtype=torch.float32)
 
-        q = self.w_q(Q_src).view(B, Lq, self.nhead, self.d_head).transpose(1, 2)  # [B,H,Lq,Dh]
-        k = self.w_k(KV_src).view(B, Lk, self.nhead, self.d_head).transpose(1, 2)
-        v = self.w_v(KV_src).view(B, Lk, self.nhead, self.d_head).transpose(1, 2)
+        x = F.relu(self.fc_in(node_scalar))   # (N, hidden)
+        x = self.dropout(x)
+        N = x.size(0)
 
-        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)  # [B,H,Lq,Lk]
-        logits = logits + torch.log(key_gate).unsqueeze(1).unsqueeze(2)          # add log(gate)
-        logits = _masked_fill(logits, key_padding_mask, value=-1e9)
-        logits = logits / self.temp
+        if edge_index is None or edge_index.numel() == 0:
+            h = F.relu(self.fc_self(x))
+            g = h.mean(dim=0)
+            return self.fc_out(g)
 
-        attn = F.softmax(logits, dim=-1)
-        attn = self.dropout(attn)
-        ctx = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, Lq, self.d_model)
-        return self.w_o(ctx)
+        src, dst = edge_index[0], edge_index[1]          # (E,), (E,)
+        msg = x[src]                                     # (E, hidden)
+        agg = torch.zeros_like(x)                        # (N, hidden)
+        agg.index_add_(0, dst, msg)
+
+        deg = torch.zeros((N, 1), device=x.device, dtype=x.dtype)
+        one = torch.ones((dst.size(0), 1), device=x.device, dtype=x.dtype)
+        deg.index_add_(0, dst, one)
+        agg = agg / deg.clamp_min(1.0)
+
+        h = F.relu(self.fc_self(x) + self.fc_nei(agg))   # (N, hidden)
+        h = self.dropout(h)
+
+        g = h.mean(dim=0)                                # (hidden,)
+        return self.fc_out(g)                            # (out_dim,)
+
+
+# ---------------------------
+# Cross-Attention with uncertainty-aware residual gating
+# ---------------------------
+class CrossAttnGate(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ln = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        # gate: concat(x, attn_out) -> sigmoid -> scalar gate per token
+        self.gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        q: torch.Tensor, q_mask: torch.Tensor,   # (B, Lq, D), (B, Lq) bool True=valid
+        kv: torch.Tensor, kv_mask: torch.Tensor  # (B, Lk, D), (B, Lk) bool True=valid
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        returns:
+          - updated q (B, Lq, D)
+          - attn_entropy_norm (B, Lq, 1)  (可用于正则)
+        """
+        # MultiheadAttention 的 key_padding_mask: True 表示需要 mask 掉
+        key_padding_mask = ~kv_mask
+        # q 侧 padding 不需要传给 MHA（它会输出所有位置），但我们后面会用 q_mask 控制 pooling
+        attn_out, attn_w = self.mha(
+            query=q,
+            key=kv,
+            value=kv,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+            average_attn_weights=False,   # -> (B, H, Lq, Lk)
+        )
+
+        ent = attention_entropy(attn_w)            # (B, Lq, 1) in [0,1]
+        conf = (1.0 - ent).clamp(0.0, 1.0)         # 越小 entropy => 越“确定”
+
+        g = self.gate(torch.cat([q, attn_out], dim=-1))  # (B, Lq, 1)
+        g = g * conf
+
+        # gated residual
+        q2 = q + self.dropout(attn_out) * g
+        q2 = self.ln(q2)
+        q2 = q2 + self.ffn(q2)
+        q2 = self.ln(q2)
+        return q2, ent
 
 
 class UGCABlock(nn.Module):
-    def __init__(self, d_model, nhead, dropout=0.1, gate_mode="mu_times_evi", lamb=1.0, g_min=1e-3, temp=0.8):
+    """
+    一层双向 cross-attention + gate:
+      P <- D
+      D <- P
+    """
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
-        self.gate_d = UncertaintyGate(d_model, dropout=dropout, gate_mode=gate_mode, lamb=lamb, g_min=g_min)
-        self.gate_p = UncertaintyGate(d_model, dropout=dropout, gate_mode=gate_mode, lamb=lamb, g_min=g_min)
+        self.p_from_d = CrossAttnGate(d_model, n_heads, dropout)
+        self.d_from_p = CrossAttnGate(d_model, n_heads, dropout)
 
-        self.ca_d_from_p = GatedCrossAttention(d_model, nhead, dropout=dropout, temp=temp)
-        self.ca_p_from_d = GatedCrossAttention(d_model, nhead, dropout=dropout, temp=temp)
-
-        self.dropout = nn.Dropout(dropout)
-        self.ln_d_1 = nn.LayerNorm(d_model)
-        self.ln_p_1 = nn.LayerNorm(d_model)
-        self.ffn_d = FeedForward(d_model, dropout=dropout)
-        self.ffn_p = FeedForward(d_model, dropout=dropout)
-        self.ln_d_2 = nn.LayerNorm(d_model)
-        self.ln_p_2 = nn.LayerNorm(d_model)
-
-    def forward(self, H_D, H_P, mask_d, mask_p):
-        g_d = self.gate_d(H_D)
-        g_p = self.gate_p(H_P)
-
-        d_from_p = self.ca_d_from_p(H_D, H_P, key_gate=g_p, key_padding_mask=mask_p)
-        p_from_d = self.ca_p_from_d(H_P, H_D, key_gate=g_d, key_padding_mask=mask_d)
-
-        H_D = self.ln_d_1(H_D + self.dropout(d_from_p))
-        H_P = self.ln_p_1(H_P + self.dropout(p_from_d))
-        H_D = self.ln_d_2(H_D + self.ffn_d(H_D))
-        H_P = self.ln_p_2(H_P + self.ffn_p(H_P))
-        return H_D, H_P
-
-
-class MeanMaxPooling(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.proj = nn.Linear(2 * d_model, d_model)
-
-    def forward(self, x, mask):
-        mask_f = mask.float()
-        sum_x = torch.einsum("bld,bl->bd", x, mask_f)
-        denom = mask_f.sum(dim=1).clamp(min=1.0).unsqueeze(-1)
-        mean = sum_x / denom
-
-        neg_inf = torch.finfo(x.dtype).min
-        max_val = x.masked_fill(mask.unsqueeze(-1) == 0, neg_inf).max(dim=1).values
-        return self.proj(torch.cat([mean, max_val], dim=-1))
-
-
-class AttnPooling(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.W = nn.Linear(d_model, d_model, bias=True)
-        self.w = nn.Linear(d_model, 1, bias=False)
-
-    def forward(self, x, mask):
-        s = self.w(torch.tanh(self.W(x))).squeeze(-1)  # [B,L]
-        s = s.masked_fill(mask == 0, -1e9)
-        a = F.softmax(s, dim=-1)
-        return torch.einsum("bl,bld->bd", a, x)
-
-
-class MHAttnPooling(nn.Module):
-    def __init__(self, d_model: int, nhead: int = 4):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(1, 1, d_model))
-        self.mha = nn.MultiheadAttention(d_model, num_heads=nhead, batch_first=True)
-
-    def forward(self, x, mask):
-        B, _, d = x.shape
-        q = self.query.expand(B, 1, d)
-        kpm = (mask == 0)
-        z, _ = self.mha(q, x, x, key_padding_mask=kpm, need_weights=False)
-        return z.squeeze(1)
-
-
-class BranchMLP(nn.Module):
-    def __init__(self, d_in, d_out, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_in, d_out),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_out, d_out),
-        )
-    def forward(self, x): return self.net(x)
-
-
-class FusionHeadMatchMLP(nn.Module):
-    def __init__(self, d_fuse, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(4 * d_fuse, 2 * d_fuse),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(2 * d_fuse, d_fuse),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_fuse, 1),
-        )
-
-    def forward(self, f_d, f_p):
-        u = torch.cat([f_d, f_p, f_d * f_p, torch.abs(f_d - f_p)], dim=-1)
-        return self.net(u).squeeze(-1)
-
-
-class FusionHeadConcatMLP(nn.Module):
-    def __init__(self, d_fuse, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2 * d_fuse, 2 * d_fuse),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(2 * d_fuse, 1),
-        )
-    def forward(self, f_d, f_p):
-        return self.net(torch.cat([f_d, f_p], dim=-1)).squeeze(-1)
-
-
-class UGCADTI(nn.Module):
-    def __init__(
+    def forward(
         self,
-        d_mol_in: int,
-        d_prot_in: int,
-        d_model: int = 128,
-        nlayers: int = 2,
-        nhead: int = 4,
-        d_fuse: int = 256,
-        pooling: Literal["meanmax", "attn", "mh-attn"] = "attn",
-        fusion_head: Literal["match-mlp", "concat-mlp"] = "match-mlp",
-        gate_mode: Literal["mu_times_evi", "mu_only", "evi_only"] = "mu_times_evi",
-        lamb: float = 1.0,
-        temp: float = 0.8,
-        g_min: float = 1e-3,
-        dropout: float = 0.5,
-    ):
-        super().__init__()
-        self.proj_mol = nn.Linear(d_mol_in, d_model)
-        self.proj_prot = nn.Linear(d_prot_in, d_model)
+        P: torch.Tensor, Pm: torch.Tensor,
+        D: torch.Tensor, Dm: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        P2, ent_p = self.p_from_d(P, Pm, D, Dm)
+        D2, ent_d = self.d_from_p(D, Dm, P, Pm)
+        # 返回两个方向的 entropy 方便做正则（可选）
+        return P2, D2, (ent_p.mean() + ent_d.mean()) * 0.5
 
-        self.layers = nn.ModuleList([
-            UGCABlock(d_model, nhead, dropout=dropout, gate_mode=gate_mode, lamb=lamb, g_min=g_min, temp=temp)
-            for _ in range(nlayers)
+
+# ---------------------------
+# Model configs
+# ---------------------------
+@dataclass
+class SeqCfg:
+    # input dims
+    d_protein: int = 1280
+    d_molclr: int = 300
+    d_chem: int = 384
+
+    # model dims
+    d_model: int = 512
+    n_heads: int = 8
+    n_layers: int = 2
+    dropout: float = 0.1
+
+    # pocket
+    use_pocket: bool = False
+    pocket_in_dim: int = 21
+    pocket_hidden: int = 128
+
+    # regularization
+    entropy_reg: float = 0.0   # >0 时对 attention entropy 做正则（越小越“确定”）
+
+
+@dataclass
+class VecCfg:
+    d_protein: int = 1280
+    d_molclr: int = 300
+    d_chem: int = 384
+    d_model: int = 512
+    dropout: float = 0.1
+
+
+# ---------------------------
+# Sequence model (UGCA v2 + global tokens)
+# ---------------------------
+class UGCASeqModel(nn.Module):
+    """
+    forward 输入对齐 datamodule 的输出：
+      - 无 pocket: (P, Pm, D, Dm, C)
+      - 有 pocket: (P, Pm, D, Dm, C, pocket_list)
+    """
+    def __init__(self, cfg: SeqCfg):
+        super().__init__()
+        self.cfg = cfg
+        d = cfg.d_model
+
+        # projections to d_model
+        self.proj_p = nn.Linear(cfg.d_protein, d, bias=False)
+        self.proj_d = nn.Linear(cfg.d_molclr,  d, bias=False)
+        self.proj_c = nn.Linear(cfg.d_chem,    d, bias=False)
+
+        # optional pocket graph encoder
+        self.use_pocket = bool(cfg.use_pocket)
+        self.pocket_enc = None
+        if self.use_pocket:
+            self.pocket_enc = PocketGraphEncoder(
+                in_dim=cfg.pocket_in_dim,
+                hidden_dim=cfg.pocket_hidden,
+                out_dim=d,
+                dropout=cfg.dropout,
+            )
+
+        # UGCA blocks
+        self.blocks = nn.ModuleList([
+            UGCABlock(d, cfg.n_heads, cfg.dropout) for _ in range(cfg.n_layers)
         ])
 
-        if pooling == "meanmax":
-            self.pool = MeanMaxPooling(d_model)
-        elif pooling == "attn":
-            self.pool = AttnPooling(d_model)
-        elif pooling == "mh-attn":
-            self.pool = MHAttnPooling(d_model, nhead=nhead)
-        else:
-            raise ValueError(f"Unknown pooling: {pooling}")
+        # head
+        self.head = nn.Sequential(
+            nn.Linear(2 * d, d),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(d, 1),
+        )
 
-        self.branch_d = BranchMLP(d_model, d_fuse, dropout)
-        self.branch_p = BranchMLP(d_model, d_fuse, dropout)
-        self.fusion = FusionHeadMatchMLP(d_fuse, dropout) if fusion_head == "match-mlp" else FusionHeadConcatMLP(d_fuse, dropout)
+    def _build_graph_token(self, pocket_batch: Optional[List[dict]], device: torch.device) -> Optional[torch.Tensor]:
+        if (not self.use_pocket) or (self.pocket_enc is None) or (pocket_batch is None):
+            return None
+        g_list: List[torch.Tensor] = []
+        for pg in pocket_batch:
+            if pg is None:
+                g_list.append(torch.zeros((self.cfg.d_model,), device=device, dtype=torch.float32))
+                continue
+            if "node_scalar_feat" not in pg or "edge_index" not in pg:
+                g_list.append(torch.zeros((self.cfg.d_model,), device=device, dtype=torch.float32))
+                continue
+            node_scalar = torch.as_tensor(pg["node_scalar_feat"], dtype=torch.float32, device=device)
+            edge_index  = torch.as_tensor(pg["edge_index"], dtype=torch.long, device=device)
+            # 防御：edge_index 可能是 (2,E) 也可能被保存成 (E,2)
+            if edge_index.ndim == 2 and edge_index.size(0) != 2 and edge_index.size(1) == 2:
+                edge_index = edge_index.t().contiguous()
+            g = self.pocket_enc(node_scalar, edge_index)  # (d,)
+            g_list.append(g)
+        return torch.stack(g_list, dim=0)  # (B, d)
 
-    def forward(self, mol, prot, mask_d, mask_p):
-        H_D = self.proj_mol(mol)
-        H_P = self.proj_prot(prot)
-        for layer in self.layers:
-            H_D, H_P = layer(H_D, H_P, mask_d, mask_p)
-        z_d = self.pool(H_D, mask_d)
-        z_p = self.pool(H_P, mask_p)
-        f_d = self.branch_d(z_d)
-        f_p = self.branch_p(z_p)
-        return self.fusion(f_d, f_p)  # [B]
+    def forward(
+        self,
+        v_prot: torch.Tensor, m_prot: torch.Tensor,
+        v_mol: torch.Tensor,  m_mol: torch.Tensor,
+        v_chem: torch.Tensor,
+        pocket_batch: Optional[List[dict]] = None,
+        topk_ratio: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        v_prot: (B, Mp, d_protein), m_prot: (B, Mp) bool
+        v_mol:  (B, Md, d_molclr),  m_mol:  (B, Md) bool
+        v_chem: (B, d_chem)
+        pocket_batch: list[dict] len=B or None
+        """
+        device = v_prot.device
+        B = v_prot.size(0)
+
+        # Project base sequences
+        P = self.proj_p(v_prot)  # (B, Mp, d)
+        D = self.proj_d(v_mol)   # (B, Md, d)
+        Pm = m_prot
+        Dm = m_mol
+
+        # [CHEM] token on drug side (always)
+        chem_tok = self.proj_c(v_chem).unsqueeze(1)  # (B,1,d)
+        D = torch.cat([chem_tok, D], dim=1)          # (B, Md+1, d)
+        chem_mask = torch.ones((B, 1), dtype=torch.bool, device=device)
+        Dm = torch.cat([chem_mask, Dm], dim=1)       # (B, Md+1)
+
+        # [GRAPH] token on protein side (optional)
+        graph_tok = self._build_graph_token(pocket_batch, device=device)
+        if graph_tok is not None:
+            graph_tok = graph_tok.unsqueeze(1)       # (B,1,d)
+            P = torch.cat([graph_tok, P], dim=1)     # (B, Mp+1, d)
+            graph_mask = torch.ones((B, 1), dtype=torch.bool, device=device)
+            Pm = torch.cat([graph_mask, Pm], dim=1)  # (B, Mp+1)
+
+        # Optional: token pruning (topk_ratio) — 这里先不做剪枝，保留接口
+        _ = topk_ratio
+
+        # UGCA layers
+        ent_acc = 0.0
+        for blk in self.blocks:
+            P, D, ent = blk(P, Pm, D, Dm)
+            ent_acc = ent_acc + ent
+
+        ent_acc = ent_acc / max(1, len(self.blocks))
+
+        # Pool to fixed vectors
+        hP = masked_mean(P, Pm)  # (B,d)
+        hD = masked_mean(D, Dm)  # (B,d)
+
+        y = self.head(torch.cat([hP, hD], dim=-1)).squeeze(-1)  # (B,)
+
+        # Optional entropy regularization hook:
+        # 你可以在训练脚本里读取 model.last_entropy 做额外 loss
+        self.last_entropy = ent_acc
+
+        return y
+
+
+# ---------------------------
+# Vector model (compatible with non-sequence mode)
+# ---------------------------
+class UGCAVecModel(nn.Module):
+    def __init__(self, cfg: VecCfg):
+        super().__init__()
+        d = cfg.d_model
+        self.proj_p = nn.Linear(cfg.d_protein, d, bias=False)
+        self.proj_d = nn.Linear(cfg.d_molclr,  d, bias=False)
+        self.proj_c = nn.Linear(cfg.d_chem,    d, bias=False)
+
+        self.head = nn.Sequential(
+            nn.Linear(3 * d, d),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(d, 1),
+        )
+
+    def forward(self, v_prot: torch.Tensor, v_mol: torch.Tensor, v_chem: torch.Tensor) -> torch.Tensor:
+        """
+        v_prot: (B, d_protein)
+        v_mol:  (B, d_molclr)
+        v_chem: (B, d_chem)
+        """
+        p = self.proj_p(v_prot)
+        d = self.proj_d(v_mol)
+        c = self.proj_c(v_chem)
+        y = self.head(torch.cat([p, d, c], dim=-1)).squeeze(-1)
+        return y
+
+
+# ---------------------------
+# Factory
+# ---------------------------
+def build_model(cfg: Dict[str, Any]) -> nn.Module:
+    """
+    cfg 来自 train.py 中 build_model_from_src 的 dict
+    必须包含：
+      - sequence: bool
+      - d_protein, d_molclr, d_chem
+    以及可选：
+      - d_model, n_heads, n_layers, dropout
+      - use_pocket, pocket_in_dim, pocket_hidden
+      - entropy_reg
+    """
+    sequence = bool(cfg.get("sequence", False))
+
+    if sequence:
+        mcfg = SeqCfg(
+            d_protein=int(cfg.get("d_protein", 1280)),
+            d_molclr=int(cfg.get("d_molclr", 300)),
+            d_chem=int(cfg.get("d_chem", 384)),
+            d_model=int(cfg.get("d_model", 512)),
+            n_heads=int(cfg.get("n_heads", 8)),
+            n_layers=int(cfg.get("n_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.1)),
+            use_pocket=bool(cfg.get("use_pocket", False)),
+            pocket_in_dim=int(cfg.get("pocket_in_dim", 21)),
+            pocket_hidden=int(cfg.get("pocket_hidden", 128)),
+            entropy_reg=float(cfg.get("entropy_reg", 0.0)),
+        )
+        return UGCASeqModel(mcfg)
+
+    vcfg = VecCfg(
+        d_protein=int(cfg.get("d_protein", 1280)),
+        d_molclr=int(cfg.get("d_molclr", 300)),
+        d_chem=int(cfg.get("d_chem", 384)),
+        d_model=int(cfg.get("d_model", 512)),
+        dropout=float(cfg.get("dropout", 0.1)),
+    )
+    return UGCAVecModel(vcfg)

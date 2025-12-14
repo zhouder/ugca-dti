@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+########################################
+# 使用方法：
+# chmod +x watch_gpu0_run.sh
+# ./watch_gpu0_run.sh
+########################################
 
 ########################################
 # 配置区：按需要改
@@ -16,27 +21,10 @@ CHECK_INTERVAL=30
 # 你的训练命令（这里用你给的命令）
 TRAIN_CMD='
 python -m src.train \
-  --dataset DAVIS \
-  --split-mode cold_protein
-  --data-root /root/lanyun-tmp \
-  --cache-root /root/lanyun-tmp/cache \
-  --batch-size 64 \
-  --nlayers 2 \
-  --nhead 4 \
-  --d-model 256 \
-  --d-fuse 512 \
-  --gate-mode mu_times_evi \
-  --g-min 1e-3 \
-  --lamb 1.0 \
-  --temp 1.0 \
-  --pooling meanmax \
-  --fusion-head match-mlp \
-  --loss focal \
-  --lr 2e-4 \
-  --epochs 100 \
-  --patience 10 \
-  --run-all \
-  --device cuda
+--sequence --use-pocket \
+--dataset BindingDB --split-mode cold-protein --batch-size 16 \
+--weight-decay 1e-4 --dropout 0.1 \
+--d-model 512 --n-heads 4 --n-layers 2
 '
 
 ########################################
