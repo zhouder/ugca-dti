@@ -22,9 +22,9 @@ CHECK_INTERVAL=30
 TRAIN_CMD='
 python -m src.train \
 --sequence --use-pocket \
---dataset BindingDB --split-mode cold-protein --batch-size 16 \
+--dataset BioSNAP --split-mode cold-drug \
 --weight-decay 1e-4 --dropout 0.1 \
---d-model 512 --n-heads 4 --n-layers 2
+--d-model 256 --n-heads 4 --n-layers 2  --batch-size 8 --workers 2
 '
 
 ########################################
