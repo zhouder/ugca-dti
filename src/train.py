@@ -317,7 +317,7 @@ def parse_args():
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--data-root", type=str, default="/root/lanyun-tmp")
     ap.add_argument("--cache-root", type=str, default="/root/lanyun-tmp/cache")
-    ap.add_argument("--out", type=str, default="/root/lanyun-tmp/ugca-runs")
+    ap.add_argument("--out", type=str, default="/root/lanyun-tmp/ugca2026")
     ap.add_argument("--resume", action="store_true")
 
     ap.add_argument("--seed", type=int, default=42)
