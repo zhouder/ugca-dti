@@ -317,7 +317,7 @@ def parse_args():
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--data-root", type=str, default="/root/lanyun-tmp")
     ap.add_argument("--cache-root", type=str, default="/root/lanyun-tmp/cache")
-    ap.add_argument("--out", type=str, default="/root/lanyun-tmp/ugca2026")
+    ap.add_argument("--out", type=str, default="/root/lanyun-tmp/ugca-runs")
     ap.add_argument("--resume", action="store_true")
 
     ap.add_argument("--seed", type=int, default=42)
@@ -328,17 +328,17 @@ def parse_args():
 
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
 
     ap.add_argument("--lr-sched", choices=["off", "cosine"], default="cosine")
     ap.add_argument("--eta-min", type=float, default=1e-5)
-    ap.add_argument("--cosine-frac", type=float, default=0.3,
+    ap.add_argument("--cosine-frac", type=float, default=0.5,
                     help="前 cosine_frac*epochs 衰减到 eta_min（默认 0.5 更快一点）")
 
     ap.add_argument("--early-stop", type=int, default=10)
-    ap.add_argument("--es-min-delta", type=float, default=1e-3)
+    ap.add_argument("--es-min-delta", type=float, default=1e-4)
 
     ap.add_argument("--amp", choices=["off", "fp16", "bf16"], default="bf16")
     ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -347,9 +347,9 @@ def parse_args():
     ap.add_argument("--use-pocket", action="store_true")
     ap.add_argument("--model-class", default="")
 
-    ap.add_argument("--d-model", type=int, default=512)
+    ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--n-heads", type=int, default=4)
-    ap.add_argument("--n-layers", type=int, default=2)
+    ap.add_argument("--n-layers", type=int, default=1)
     ap.add_argument("--dropout", type=float, default=0.1)
 
     ap.add_argument("--pocket-in-dim", type=int, default=21)
