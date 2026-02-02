@@ -9,19 +9,14 @@ from torch_geometric.data import Data, Batch
 class DTIDataset(Dataset):
     def __init__(self, df, root_dir, dataset_name, cache=False, verbose=False):
         self.df = df.reset_index(drop=True)
-
         self.root_dir = root_dir
         self.dataset_name = dataset_name
-
         base = os.path.join(root_dir, dataset_name)
         self.h5_path = os.path.join(base, f"{dataset_name}_data.h5")
         self.use_h5 = os.path.exists(self.h5_path)
 
         if verbose:
-            if self.use_h5:
-                print(f">>> Data Source: HDF5 ({self.h5_path})")
-            else:
-                print(f">>> Data Source: Raw Files (Slow) at {base}")
+            print(f">>> Data Source: {'HDF5' if self.use_h5 else 'Raw Files'} at {base}")
 
         if not self.use_h5:
             self.paths = {
